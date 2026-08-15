@@ -3,6 +3,8 @@ import json
 import time
 import random
 import threading
+import urllib.parse
+import urllib.request
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from googleapiclient.discovery import build
 from auth import Authorize
@@ -175,6 +177,34 @@ def main():
                         ]
                         joke = random.choice(dad_jokes)
                         sendReplyToLiveChat(liveChatId, joke)
+
+                    elif lower_msg.startswith("!chatmbr"):
+                        query = message_text[8:].strip()
+                        if not query:
+                            sendReplyToLiveChat(
+                                liveChatId,
+                                f"@{userName} Please provide a query! Usage: !chatmbr <question>"
+                            )
+                        else:
+                            try:
+                                encoded_query = urllib.parse.quote(query)
+                                api_url = f"https://chatmbr-bot.vercel.app/api/chat?query={encoded_query}"
+                                req = urllib.request.Request(
+                                    api_url, headers={"User-Agent": "Mozilla/5.0"}
+                                )
+                                with urllib.request.urlopen(req, timeout=8) as api_response:
+                                    api_reply = api_response.read().decode("utf-8").strip()
+
+                                # Truncate reply to avoid YouTube's 200-character chat limit
+                                if len(api_reply) > 200:
+                                    api_reply = api_reply[:197] + "..."
+
+                                sendReplyToLiveChat(liveChatId, api_reply)
+                            except Exception as e:
+                                print(f"Error fetching from MBR API: {e}")
+                                sendReplyToLiveChat(
+                                    liveChatId, f"@{userName} Unable to reach MBR right now."
+                                )
 
             # Prevent memory build-up
             if len(processed_message_ids) > 1000:
