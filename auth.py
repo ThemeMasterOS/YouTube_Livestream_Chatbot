@@ -3,9 +3,6 @@ from dotenv import load_dotenv
 from google_auth_oauthlib.flow import InstalledAppFlow
 
 load_dotenv()
-client_id = os.getenv('CLIENT_ID')
-client_secret = os.getenv('CLIENT_SECRET')
-
 
 def Authorize(file):
     flow = InstalledAppFlow.from_client_secrets_file(file, scopes={
@@ -16,8 +13,17 @@ def Authorize(file):
         'https://www.googleapis.com/auth/youtube.force-ssl',
         'https://www.googleapis.com/auth/youtube.readonly',
     })
-    flow.run_local_server(
-        host='localhost',
-        port=5500,
-        authorization_prompt_message="")
+    
+    # We use redirect_uri = 'http://localhost:5500/' matching your OAuth Client ID setup
+    flow.redirect_uri = 'http://localhost:5500/'
+    
+    auth_url, _ = flow.authorization_url(prompt='consent')
+    
+    print("\n" + "="*50)
+    print("PLEASE GO TO THIS URL ON YOUR PHONE/BROWSER TO AUTHENTICATE:")
+    print(auth_url)
+    print("="*50 + "\n")
+    
+    # Render logs will prompt for code if needed or process authorization flow
     return flow
+    
