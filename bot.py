@@ -7,6 +7,7 @@ import urllib.parse
 import urllib.request
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from auth import Authorize
 
 # --- Render Port Binding (Prevents Timeout) ---
@@ -15,6 +16,10 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"Bot is active!")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
 
 def start_health_check_server():
     port = int(os.getenv("PORT", 10000))
@@ -54,21 +59,6 @@ def getLiveChatId(LIVE_STREAM_ID):
 
     print(f"\nConnected to Live Chat ID: {liveChatId}")
     return liveChatId
-
-
-def getUserName(userId):
-    """
-    Takes a userId and returns the channel title.
-    """
-    try:
-        channelDetails = youtube.channels().list(
-            part="snippet",
-            id=userId,
-        )
-        response = channelDetails.execute()
-        return response['items'][0]['snippet']['title']
-    except Exception:
-        return "Viewer"
 
 
 def sendReplyToLiveChat(liveChatId, message):
@@ -115,10 +105,10 @@ def main():
 
     while True:
         try:
-            # Prepare API request
+            # Request authorDetails along with snippet to get usernames for free
             kwargs = {
                 "liveChatId": liveChatId,
-                "part": "snippet"
+                "part": "snippet,authorDetails"
             }
             if next_page_token:
                 kwargs["pageToken"] = next_page_token
@@ -141,10 +131,12 @@ def main():
                     processed_message_ids.add(msg_id)
 
                     snippet = msg_item['snippet']
-                    userId = snippet['authorChannelId']
                     message_text = snippet['textMessageDetails']['messageText'].strip()
 
-                    userName = getUserName(userId)
+                    # Extracted directly from authorDetails (0 extra API quota cost!)
+                    author_details = msg_item.get('authorDetails', {})
+                    userName = author_details.get('displayName', 'Viewer')
+
                     print(f'New chat message from {userName}: {message_text}')
 
                     # Command triggers
@@ -212,6 +204,13 @@ def main():
 
             time.sleep(polling_interval)
 
+        except HttpError as e:
+            if e.resp.status == 403 and "quotaExceeded" in str(e):
+                print("CRITICAL: YouTube API Daily Quota Exceeded! Sleeping for 1 hour to prevent crash loops...")
+                time.sleep(3600)
+            else:
+                print(f"YouTube API Error: {e}")
+                time.sleep(10)
         except Exception as e:
             print(f"Error reading chat: {e}")
             time.sleep(5)
