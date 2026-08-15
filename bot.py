@@ -2,8 +2,26 @@ import os
 import json
 import time
 import random
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from googleapiclient.discovery import build
 from auth import Authorize
+
+# --- Render Port Binding (Prevents Timeout) ---
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is active!")
+
+def start_health_check_server():
+    port = int(os.getenv("PORT", 10000))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    server.serve_forever()
+
+# Start health check server in background thread
+threading.Thread(target=start_health_check_server, daemon=True).start()
+# -----------------------------------------------
 
 # Authorize returns Credentials directly
 credentials = Authorize('client_secret.json')
