@@ -18,24 +18,26 @@ def Authorize(file):
         redirect_uri='http://localhost:5500/'
     )
     
-    auth_url, _ = flow.authorization_url(prompt='consent', access_type='offline')
+    # Check if code is passed via Render Environment Variable
+    auth_code = os.getenv('AUTH_CODE')
     
-    print("\n" + "="*60)
-    print("1. OPEN THIS URL IN YOUR BROWSER:")
-    print(auth_url)
-    print("="*60)
-    print("2. AFTER AUTHORIZING, YOU WILL BE REDIRECTED TO A LOCALHOST URL.")
-    print("3. COPY THE FULL REDIRECT URL (OR THE 'code=' VALUE) AND PASTE IT BELOW.")
-    print("="*60 + "\n")
-    
-    code = input("Enter the authorization code or full redirect URL: ").strip()
-    
-    if "code=" in code:
-        # Extract authorization code from the full redirect URL if pasted
-        from urllib.parse import urlparse, parse_qs
-        parsed = urlparse(code)
-        code = parse_qs(parsed.query).get('code', [code])[0]
+    if not auth_code:
+        auth_url, _ = flow.authorization_url(prompt='consent', access_type='offline')
+        print("\n" + "="*60)
+        print("1. OPEN THIS LINK ON YOUR PHONE:")
+        print(auth_url)
+        print("="*60)
+        print("2. AFTER AUTHORIZING, COPY THE FULL REDIRECT URL OR CODE.")
+        print("3. GO TO RENDER -> ENVIRONMENT VARIABLES -> ADD 'AUTH_CODE'.")
+        print("="*60 + "\n")
+        raise Exception("AUTH_CODE variable missing. Please add AUTH_CODE to Render Environment Variables and redeploy.")
 
-    flow.fetch_token(code=code)
+    # Clean up code if full URL was pasted
+    if "code=" in auth_code:
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(auth_code)
+        auth_code = parse_qs(parsed.query).get('code', [auth_code])[0]
+
+    flow.fetch_token(code=auth_code)
     return flow
     
