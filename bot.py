@@ -1,149 +1,172 @@
+import os
 import json
 import time
 import random
 from googleapiclient.discovery import build
 from auth import Authorize
 
-authResponse = Authorize('client_secret.json')
-credentials = authResponse.credentials
+# Authorize returns Credentials directly
+credentials = Authorize('client_secret.json')
 
 # Building the youtube object:
 youtube = build('youtube', 'v3', credentials=credentials)
 
-# Settings
-_delay = 1
-
-
 
 def getLiveChatId(LIVE_STREAM_ID):
     """
-    It takes a live stream ID as input, and returns the live chat ID associated with that live stream
-
-    LIVE_STREAM_ID: The ID of the live stream
-    return: The live chat ID of the live stream.
+    Takes a live stream ID as input, and returns the active live chat ID.
     """
-
     stream = youtube.videos().list(
         part="liveStreamingDetails",
-        id=LIVE_STREAM_ID,  # Live stream ID
+        id=LIVE_STREAM_ID,
     )
     response = stream.execute()
-    # print("\nLive Stream Details:  ", json.dumps(response, indent=2))
 
-    liveChatId = response['items'][0]['liveStreamingDetails']['activeLiveChatId']
-    print("\nLive Chat ID: ", liveChatId)
+    items = response.get('items', [])
+    if not items:
+        raise Exception(f"Live stream with ID '{LIVE_STREAM_ID}' not found.")
+
+    live_details = items[0].get('liveStreamingDetails', {})
+    liveChatId = live_details.get('activeLiveChatId')
+
+    if not liveChatId:
+        raise Exception(f"No active live chat found for stream '{LIVE_STREAM_ID}'. Make sure the stream is live!")
+
+    print(f"\nConnected to Live Chat ID: {liveChatId}")
     return liveChatId
 
 
-# Access user's channel Name:
 def getUserName(userId):
     """
-    It takes a userId and returns the userName.
-
-    userId: The user's YouTube channel ID
-    return: User's Channel Name
+    Takes a userId and returns the channel title.
     """
-    channelDetails = youtube.channels().list(
-        part="snippet",
-        id=userId,
-    )
-    response = channelDetails.execute()
-    # print(json.dumps(response, indent=2))
-    userName = response['items'][0]['snippet']['title']
-    return userName
-# print(getUserName("UC0YXSy_J8uTDEr7YX_-d-sg"))
+    try:
+        channelDetails = youtube.channels().list(
+            part="snippet",
+            id=userId,
+        )
+        response = channelDetails.execute()
+        return response['items'][0]['snippet']['title']
+    except Exception:
+        return "Viewer"
 
 
 def sendReplyToLiveChat(liveChatId, message):
     """
-    It takes a liveChatId and a message, and sends the message to the live chat.
-
-    liveChatId: The ID of the live chat to which the message should be sent
-    message: The message you want to send to the chat
+    Sends a text message to the specified live chat.
     """
-    reply = youtube.liveChatMessages().insert(
-        part="snippet",
-        body={
-            "snippet": {
-                "liveChatId": liveChatId,
-                "type": "textMessageEvent",
-                "textMessageDetails": {
-                    "messageText": message,
+    try:
+        reply = youtube.liveChatMessages().insert(
+            part="snippet",
+            body={
+                "snippet": {
+                    "liveChatId": liveChatId,
+                    "type": "textMessageEvent",
+                    "textMessageDetails": {
+                        "messageText": message,
+                    }
                 }
             }
-        }
-    )
-    response = reply.execute()
-    print("Message sent!")
+        )
+        reply.execute()
+        print(f"Bot replied: {message}")
+    except Exception as e:
+        print(f"Failed to send message: {e}")
 
 
 def main():
-    LIVE_STREAM_ID = input("Enter the live stream ID: ")
-    # LIVE_STREAM_ID = "zxJ01IK_9z0"
+    # Read stream ID from Render Environment Variables instead of input()
+    LIVE_STREAM_ID = os.getenv('LIVE_STREAM_ID')
+
+    if not LIVE_STREAM_ID:
+        print("\n" + "="*60)
+        print("ERROR: LIVE_STREAM_ID environment variable is missing!")
+        print("Go to Render -> Environment -> Add 'LIVE_STREAM_ID'")
+        print("="*60 + "\n")
+        raise Exception("LIVE_STREAM_ID environment variable missing.")
+
     liveChatId = getLiveChatId(LIVE_STREAM_ID)
-    messagesList = []  # List of messages
+
+    # Track processed messages using message IDs to prevent duplicate replies
+    processed_message_ids = set()
+    next_page_token = None
+
+    print("\nBot is running and listening for stream messages...")
 
     while True:
-        # bot replies to every message within past 1 second (can be changed to add delay):
-        time.sleep(1)
+        try:
+            # Prepare API request
+            kwargs = {
+                "liveChatId": liveChatId,
+                "part": "snippet"
+            }
+            if next_page_token:
+                kwargs["pageToken"] = next_page_token
 
-        notReadMessages = []  # List of messages not yet read by bot
+            # Fetch messages
+            liveChat = youtube.liveChatMessages().list(**kwargs)
+            response = liveChat.execute()
 
-        # Fetching the messages from the live chat:
-        liveChat = youtube.liveChatMessages().list(
-            liveChatId=liveChatId,
-            part="snippet"
-        )
-        response = liveChat.execute()
-        # print("\nMessages Fetched:  ", json.dumps(response, indent=2))
-        allMessages = response['items']
+            # YouTube specifies how long to wait before polling again
+            next_page_token = response.get('nextPageToken')
+            polling_interval = response.get('pollingIntervalMillis', 2000) / 1000.0
 
-        # Check if there are any new messages and add them messagesList/notReadMessages list:
-        if len(messagesList) >= 0:
-            for messages in allMessages:
-                userId = messages['snippet']['authorChannelId']
-                message = messages['snippet']['textMessageDetails']['messageText']
-                messagesList.append((userId, message))
-        else:
-            for messages in allMessages:
-                userId = messages['snippet']['authorChannelId']
-                message = messages['snippet']['textMessageDetails']['messageText']
-                if (userId, message) not in messagesList:
-                    notReadMessages.append((userId, message))
-                if (userId, message) not in messagesList:
-                    messagesList.append((userId, message))
-            print("New Message: ", notReadMessages)
+            allMessages = response.get('items', [])
 
-        for message in notReadMessages:
-            userId = message[0]
-            message = message[1]
-            userName = getUserName(userId)
-            print(f'\nUsername: {userName}')
+            for msg_item in allMessages:
+                msg_id = msg_item['id']
 
-            if (message == "Hello" or message == "hello" or message == "Hi" or message == "hi"):
-                sendReplyToLiveChat(
-                    liveChatId,
-                    "Hey " + userName + "! Welcome to the stream!")
+                # Process only unread messages
+                if msg_id not in processed_message_ids:
+                    processed_message_ids.add(msg_id)
 
-            if (message == "!discord" or message == "!disc"):
-                discord_link = "https://discord.gg/"
-                sendReplyToLiveChat(
-                    liveChatId,
-                    f'Join our discord! {discord_link}')
+                    snippet = msg_item['snippet']
+                    userId = snippet['authorChannelId']
+                    message_text = snippet['textMessageDetails']['messageText'].strip()
 
-            if (message == "!random" or message == "!rand"):
-                dad_jokes = [
-                    "Why do fathers take an extra pair of socks when they go golfing? In case they get a hole in one!",
-                    "Dear Math, grow up and solve your own problems.",
-                    "What has more letters than the alphabet? The post office!",
-                    "Why are elevator jokes so classic and good? They work on so many levels!",
-                    "What do you call a fake noodle? An impasta!",
-                    "What do you call a belt made out of watches? A waist of time!",
-                    "Why did the scarecrow win an award? Because he was outstanding in his field!",
-                    "Why don't skeletons ever go trick or treating? Because they have no body to go with!",
-                    "What's brown and sticky? A stick!"]
-                joke = random.choice(dad_jokes)
-                sendReplyToLiveChat(liveChatId, joke)
+                    userName = getUserName(userId)
+                    print(f'New chat message from {userName}: {message_text}')
+
+                    # Command triggers
+                    lower_msg = message_text.lower()
+
+                    if lower_msg in ["hello", "hi", "hey"]:
+                        sendReplyToLiveChat(
+                            liveChatId,
+                            f"Hey {userName}! Welcome to the stream!"
+                        )
+
+                    elif lower_msg in ["!discord", "!disc"]:
+                        discord_link = "https://discord.gg/"
+                        sendReplyToLiveChat(
+                            liveChatId,
+                            f"Join our discord! {discord_link}"
+                        )
+
+                    elif lower_msg in ["!random", "!rand"]:
+                        dad_jokes = [
+                            "Why do fathers take an extra pair of socks when they go golfing? In case they get a hole in one!",
+                            "Dear Math, grow up and solve your own problems.",
+                            "What has more letters than the alphabet? The post office!",
+                            "Why are elevator jokes so classic and good? They work on so many levels!",
+                            "What do you call a fake noodle? An impasta!",
+                            "What do you call a belt made out of watches? A waist of time!",
+                            "Why did the scarecrow win an award? Because he was outstanding in his field!",
+                            "Why don't skeletons ever go trick or treating? Because they have no body to go with!",
+                            "What's brown and sticky? A stick!"
+                        ]
+                        joke = random.choice(dad_jokes)
+                        sendReplyToLiveChat(liveChatId, joke)
+
+            # Prevent memory build-up
+            if len(processed_message_ids) > 1000:
+                processed_message_ids.clear()
+
+            time.sleep(polling_interval)
+
+        except Exception as e:
+            print(f"Error reading chat: {e}")
+            time.sleep(5)
 
 
 if __name__ == "__main__":
