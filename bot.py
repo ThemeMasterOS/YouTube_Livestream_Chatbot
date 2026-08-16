@@ -97,7 +97,7 @@ def main():
 
     liveChatId = getLiveChatId(LIVE_STREAM_ID)
 
-    # Blocklist for bot usernames (lowercase)
+    # Blocklist for bot usernames/handles (lowercase)
     BLOCKED_BOTS = {"nightbot", "streamelements", "moobot"}
 
     # Track processed messages using message IDs to prevent duplicate replies
@@ -108,7 +108,7 @@ def main():
 
     while True:
         try:
-            # Request authorDetails along with snippet to get usernames for free
+            # Request authorDetails along with snippet to get usernames and handles for free
             kwargs = {
                 "liveChatId": liveChatId,
                 "part": "snippet,authorDetails"
@@ -136,10 +136,14 @@ def main():
                     # Extracted directly from authorDetails (0 extra API quota cost!)
                     author_details = msg_item.get('authorDetails', {})
                     userName = author_details.get('displayName', 'Viewer')
+                    userHandle = author_details.get('channelHandle', '')
 
-                    # Skip processing if the message is from a blocked bot/user
-                    if userName.lower() in BLOCKED_BOTS:
-                        print(f"Ignored message from blocked bot: {userName}")
+                    # Normalize by removing '@' and converting to lowercase
+                    clean_name = userName.lower().replace('@', '')
+                    clean_handle = userHandle.lower().replace('@', '')
+
+                    # Silently skip processing if the message is from a blocked bot
+                    if any(bot in clean_name or bot in clean_handle for bot in BLOCKED_BOTS):
                         continue
 
                     snippet = msg_item['snippet']
@@ -226,3 +230,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+                            
