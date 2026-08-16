@@ -97,6 +97,9 @@ def main():
 
     liveChatId = getLiveChatId(LIVE_STREAM_ID)
 
+    # Blocklist for bot usernames (lowercase)
+    BLOCKED_BOTS = {"nightbot", "streamelements", "moobot"}
+
     # Track processed messages using message IDs to prevent duplicate replies
     processed_message_ids = set()
     next_page_token = None
@@ -130,12 +133,17 @@ def main():
                 if msg_id not in processed_message_ids:
                     processed_message_ids.add(msg_id)
 
-                    snippet = msg_item['snippet']
-                    message_text = snippet['textMessageDetails']['messageText'].strip()
-
                     # Extracted directly from authorDetails (0 extra API quota cost!)
                     author_details = msg_item.get('authorDetails', {})
                     userName = author_details.get('displayName', 'Viewer')
+
+                    # Skip processing if the message is from a blocked bot/user
+                    if userName.lower() in BLOCKED_BOTS:
+                        print(f"Ignored message from blocked bot: {userName}")
+                        continue
+
+                    snippet = msg_item['snippet']
+                    message_text = snippet['textMessageDetails']['messageText'].strip()
 
                     print(f'New chat message from {userName}: {message_text}')
 
@@ -149,7 +157,7 @@ def main():
                         )
 
                     elif lower_msg in ["!discord", "!disc"]:
-                        discord_link = "https://discord.gg/"
+                        discord_link = "https://discord.gg/9tADYVHc3Y"
                         sendReplyToLiveChat(
                             liveChatId,
                             f"Join our discord! {discord_link}"
