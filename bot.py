@@ -100,6 +100,10 @@ def main():
     # Blocklist for bot usernames/handles (lowercase)
     BLOCKED_BOTS = {"nightbot", "streamelements", "moobot"}
 
+    # Global Cooldown Settings
+    COOLDOWN_SECONDS = 10
+    last_reply_time = 0
+
     # Track processed messages using message IDs to prevent duplicate replies
     processed_message_ids = set()
     next_page_token = None
@@ -154,61 +158,83 @@ def main():
                     # Command triggers
                     lower_msg = message_text.lower()
 
-                    if lower_msg in ["hello", "hi", "hey"]:
-                        sendReplyToLiveChat(
-                            liveChatId,
-                            f"Hey {userName}! Welcome to the stream!"
-                        )
+                    # Define valid command triggers
+                    is_command = (
+                        lower_msg in ["hello", "hi", "hey", "!discord", "!disc", "!random", "!rand"]
+                        or lower_msg.startswith("!chatmbr")
+                    )
 
-                    elif lower_msg in ["!discord", "!disc"]:
-                        discord_link = "https://discord.gg/9tADYVHc3Y"
-                        sendReplyToLiveChat(
-                            liveChatId,
-                            f"Join our discord! {discord_link}"
-                        )
+                    if is_command:
+                        current_time = time.time()
+                        
+                        # Check global cooldown
+                        if current_time - last_reply_time < COOLDOWN_SECONDS:
+                            time_left = int(COOLDOWN_SECONDS - (current_time - last_reply_time))
+                            print(f"Skipped reply to {userName}: Cooldown active ({time_left}s remaining)")
+                            continue
 
-                    elif lower_msg in ["!random", "!rand"]:
-                        dad_jokes = [
-                            "Why do fathers take an extra pair of socks when they go golfing? In case they get a hole in one!",
-                            "Dear Math, grow up and solve your own problems.",
-                            "What has more letters than the alphabet? The post office!",
-                            "Why are elevator jokes so classic and good? They work on so many levels!",
-                            "What do you call a fake noodle? An impasta!",
-                            "What do you call a belt made out of watches? A waist of time!",
-                            "Why did the scarecrow win an award? Because he was outstanding in his field!",
-                            "Why don't skeletons ever go trick or treating? Because they have no body to go with!",
-                            "What's brown and sticky? A stick!"
-                        ]
-                        joke = random.choice(dad_jokes)
-                        sendReplyToLiveChat(liveChatId, joke)
-
-                    elif lower_msg.startswith("!chatmbr"):
-                        query = message_text[8:].strip()
-                        if not query:
+                        # Execute commands and update the reply timestamp
+                        if lower_msg in ["hello", "hi", "hey"]:
                             sendReplyToLiveChat(
                                 liveChatId,
-                                f"@{userName} Please provide a query! Usage: !chatmbr <question>"
+                                f"Hey {userName}! Welcome to the stream!"
                             )
-                        else:
-                            try:
-                                encoded_query = urllib.parse.quote(query)
-                                api_url = f"https://chatmbr-bot.vercel.app/api/chat?query={encoded_query}"
-                                req = urllib.request.Request(
-                                    api_url, headers={"User-Agent": "Mozilla/5.0"}
-                                )
-                                with urllib.request.urlopen(req, timeout=8) as api_response:
-                                    api_reply = api_response.read().decode("utf-8").strip()
+                            last_reply_time = time.time()
 
-                                # Truncate reply to avoid YouTube's 200-character chat limit
-                                if len(api_reply) > 200:
-                                    api_reply = api_reply[:197] + "..."
+                        elif lower_msg in ["!discord", "!disc"]:
+                            discord_link = "https://discord.gg/"
+                            sendReplyToLiveChat(
+                                liveChatId,
+                                f"Join our discord! {discord_link}"
+                            )
+                            last_reply_time = time.time()
 
-                                sendReplyToLiveChat(liveChatId, api_reply)
-                            except Exception as e:
-                                print(f"Error fetching from MBR API: {e}")
+                        elif lower_msg in ["!random", "!rand"]:
+                            dad_jokes = [
+                                "Why do fathers take an extra pair of socks when they go golfing? In case they get a hole in one!",
+                                "Dear Math, grow up and solve your own problems.",
+                                "What has more letters than the alphabet? The post office!",
+                                "Why are elevator jokes so classic and good? They work on so many levels!",
+                                "What do you call a fake noodle? An impasta!",
+                                "What do you call a belt made out of watches? A waist of time!",
+                                "Why did the scarecrow win an award? Because he was outstanding in his field!",
+                                "Why don't skeletons ever go trick or treating? Because they have no body to go with!",
+                                "What's brown and sticky? A stick!"
+                            ]
+                            joke = random.choice(dad_jokes)
+                            sendReplyToLiveChat(liveChatId, joke)
+                            last_reply_time = time.time()
+
+                        elif lower_msg.startswith("!chatmbr"):
+                            query = message_text[8:].strip()
+                            if not query:
                                 sendReplyToLiveChat(
-                                    liveChatId, f"@{userName} Unable to reach MBR right now."
+                                    liveChatId,
+                                    f"@{userName} Please provide a query! Usage: !chatmbr <question>"
                                 )
+                                last_reply_time = time.time()
+                            else:
+                                try:
+                                    encoded_query = urllib.parse.quote(query)
+                                    api_url = f"https://chatmbr-bot.vercel.app/api/chat?query={encoded_query}"
+                                    req = urllib.request.Request(
+                                        api_url, headers={"User-Agent": "Mozilla/5.0"}
+                                    )
+                                    with urllib.request.urlopen(req, timeout=8) as api_response:
+                                        api_reply = api_response.read().decode("utf-8").strip()
+
+                                    # Truncate reply to avoid YouTube's 200-character chat limit
+                                    if len(api_reply) > 200:
+                                        api_reply = api_reply[:197] + "..."
+
+                                    sendReplyToLiveChat(liveChatId, api_reply)
+                                    last_reply_time = time.time()
+                                except Exception as e:
+                                    print(f"Error fetching from MBR API: {e}")
+                                    sendReplyToLiveChat(
+                                        liveChatId, f"@{userName} Unable to reach MBR right now."
+                                    )
+                                    last_reply_time = time.time()
 
             # Prevent memory build-up
             if len(processed_message_ids) > 1000:
@@ -230,4 +256,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-                            
