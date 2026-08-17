@@ -236,9 +236,9 @@ def main():
                                     )
                                     last_reply_time = time.time()
 
-            # Prevent memory build-up
+            # Prevent memory build-up without losing recent message history
             if len(processed_message_ids) > 1000:
-                processed_message_ids.clear()
+                processed_message_ids = set(list(processed_message_ids)[-500:])
 
             time.sleep(polling_interval)
 
