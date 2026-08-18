@@ -125,7 +125,7 @@ def main():
                 lower_msg = message_text.lower()
                 is_command = (
                     lower_msg in ["hello", "hi", "hey", "!discord", "!disc", "!random", "!rand"]
-                    or lower_msg.startswith("!chatmbr", "!ai")
+                    or lower_msg.startswith(("!chatmbr", "!ai"))
                 )
 
                 if is_command:
@@ -168,7 +168,7 @@ def main():
                         sendReplyToLiveChat(liveChatId, joke)
                         last_reply_time = time.time()
 
-                    elif lower_msg.startswith("!chatmbr", "!ai"):
+                    elif lower_msg.startswith(("!chatmbr", "!ai")):
                         query = message_text[8:].strip()
                         if not query:
                             sendReplyToLiveChat(
