@@ -169,7 +169,11 @@ def main():
                         last_reply_time = time.time()
 
                     elif lower_msg.startswith(("!chatmbr", "!ai")):
-                        query = message_text[8:].strip()
+                        if lower_msg.startswith("!chatmbr"):
+                            query = message_text[8:].strip()
+                        else:
+                            query = message_text[3:].strip()
+                            
                         if not query:
                             sendReplyToLiveChat(
                                 liveChatId,
