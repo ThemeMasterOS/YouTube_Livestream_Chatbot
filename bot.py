@@ -5,6 +5,7 @@ import random
 import threading
 import urllib.parse
 import urllib.request
+import pytchat
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -33,7 +34,7 @@ threading.Thread(target=start_health_check_server, daemon=True).start()
 # Authorize returns Credentials directly
 credentials = Authorize('client_secret.json')
 
-# Building the youtube object:
+# Building the youtube object for sending replies
 youtube = build('youtube', 'v3', credentials=credentials)
 
 
@@ -63,7 +64,7 @@ def getLiveChatId(LIVE_STREAM_ID):
 
 def sendReplyToLiveChat(liveChatId, message):
     """
-    Sends a text message to the specified live chat.
+    Sends a text message to the specified live chat (Costs 50 quota units).
     """
     try:
         reply = youtube.liveChatMessages().insert(
@@ -85,7 +86,6 @@ def sendReplyToLiveChat(liveChatId, message):
 
 
 def main():
-    # Read stream ID from Render Environment Variables instead of input()
     LIVE_STREAM_ID = os.getenv('LIVE_STREAM_ID')
 
     if not LIVE_STREAM_ID:
@@ -95,162 +95,120 @@ def main():
         print("="*60 + "\n")
         raise Exception("LIVE_STREAM_ID environment variable missing.")
 
+    # Get chat ID for sending API replies
     liveChatId = getLiveChatId(LIVE_STREAM_ID)
 
-    # Blocklist for bot usernames/handles (lowercase)
     BLOCKED_BOTS = {"nightbot", "streamelements", "moobot"}
-
-    # Global Cooldown Settings
     COOLDOWN_SECONDS = 10
     last_reply_time = 0
 
-    # Track processed messages using message IDs to prevent duplicate replies
-    processed_message_ids = set()
-    next_page_token = None
+    print("\nConnecting pytchat listener (0 quota cost)...")
+    chat = pytchat.create(video_id=LIVE_STREAM_ID)
+    print("Bot is listening for messages...")
 
-    print("\nBot is running and listening for stream messages...")
-
-    while True:
+    while chat.is_alive():
         try:
-            # Request authorDetails along with snippet to get usernames and handles for free
-            kwargs = {
-                "liveChatId": liveChatId,
-                "part": "snippet,authorDetails"
-            }
-            if next_page_token:
-                kwargs["pageToken"] = next_page_token
+            for msg_item in chat.get().sync_items():
+                userName = msg_item.author.name
+                userChannelId = getattr(msg_item.author, 'channelId', '')
 
-            # Fetch messages
-            liveChat = youtube.liveChatMessages().list(**kwargs)
-            response = liveChat.execute()
+                clean_name = userName.lower().replace('@', '')
+                clean_handle = str(userChannelId).lower().replace('@', '')
 
-            # YouTube specifies how long to wait before polling again
-            next_page_token = response.get('nextPageToken')
-            polling_interval = response.get('pollingIntervalMillis', 2000) / 1000.0
+                # Skip blocked bots
+                if any(bot in clean_name or bot in clean_handle for bot in BLOCKED_BOTS):
+                    continue
 
-            allMessages = response.get('items', [])
+                message_text = msg_item.message.strip()
+                print(f"New chat message from {userName}: {message_text}")
 
-            for msg_item in allMessages:
-                msg_id = msg_item['id']
+                lower_msg = message_text.lower()
+                is_command = (
+                    lower_msg in ["hello", "hi", "hey", "!discord", "!disc", "!random", "!rand"]
+                    or lower_msg.startswith("!chatmbr", "!ai")
+                )
 
-                # Process only unread messages
-                if msg_id not in processed_message_ids:
-                    processed_message_ids.add(msg_id)
+                if is_command:
+                    current_time = time.time()
 
-                    # Extracted directly from authorDetails (0 extra API quota cost!)
-                    author_details = msg_item.get('authorDetails', {})
-                    userName = author_details.get('displayName', 'Viewer')
-                    userHandle = author_details.get('channelHandle', '')
-
-                    # Normalize by removing '@' and converting to lowercase
-                    clean_name = userName.lower().replace('@', '')
-                    clean_handle = userHandle.lower().replace('@', '')
-
-                    # Silently skip processing if the message is from a blocked bot
-                    if any(bot in clean_name or bot in clean_handle for bot in BLOCKED_BOTS):
+                    # Check global cooldown
+                    if current_time - last_reply_time < COOLDOWN_SECONDS:
+                        time_left = int(COOLDOWN_SECONDS - (current_time - last_reply_time))
+                        print(f"Skipped reply to {userName}: Cooldown active ({time_left}s remaining)")
                         continue
 
-                    snippet = msg_item['snippet']
-                    message_text = snippet['textMessageDetails']['messageText'].strip()
+                    if lower_msg in ["hello", "hi", "hey"]:
+                        sendReplyToLiveChat(
+                            liveChatId,
+                            f"Hey {userName}! Welcome to the stream!"
+                        )
+                        last_reply_time = time.time()
 
-                    print(f'New chat message from {userName}: {message_text}')
+                    elif lower_msg in ["!discord", "!disc"]:
+                        discord_link = "https://discord.gg/9tADYVHc3Y"
+                        sendReplyToLiveChat(
+                            liveChatId,
+                            f"Join our discord! {discord_link}"
+                        )
+                        last_reply_time = time.time()
 
-                    # Command triggers
-                    lower_msg = message_text.lower()
+                    elif lower_msg in ["!random", "!rand"]:
+                        dad_jokes = [
+                            "Why do fathers take an extra pair of socks when they go golfing? In case they get a hole in one!",
+                            "Dear Math, grow up and solve your own problems.",
+                            "What has more letters than the alphabet? The post office!",
+                            "Why are elevator jokes so classic and good? They work on so many levels!",
+                            "What do you call a fake noodle? An impasta!",
+                            "What do you call a belt made out of watches? A waist of time!",
+                            "Why did the scarecrow win an award? Because he was outstanding in his field!",
+                            "Why don't skeletons ever go trick or treating? Because they have no body to go with!",
+                            "What's brown and sticky? A stick!"
+                        ]
+                        joke = random.choice(dad_jokes)
+                        sendReplyToLiveChat(liveChatId, joke)
+                        last_reply_time = time.time()
 
-                    # Define valid command triggers
-                    is_command = (
-                        lower_msg in ["hello", "hi", "hey", "!discord", "!disc", "!random", "!rand"]
-                        or lower_msg.startswith("!chatmbr")
-                    )
-
-                    if is_command:
-                        current_time = time.time()
-                        
-                        # Check global cooldown
-                        if current_time - last_reply_time < COOLDOWN_SECONDS:
-                            time_left = int(COOLDOWN_SECONDS - (current_time - last_reply_time))
-                            print(f"Skipped reply to {userName}: Cooldown active ({time_left}s remaining)")
-                            continue
-
-                        # Execute commands and update the reply timestamp
-                        if lower_msg in ["hello", "hi", "hey"]:
+                    elif lower_msg.startswith("!chatmbr", "!ai"):
+                        query = message_text[8:].strip()
+                        if not query:
                             sendReplyToLiveChat(
                                 liveChatId,
-                                f"Hey {userName}! Welcome to the stream!"
+                                f"{userName} Please provide a query! Usage: !chatmbr <question> or !ai <question>"
                             )
                             last_reply_time = time.time()
+                        else:
+                            try:
+                                encoded_query = urllib.parse.quote(query)
+                                api_url = f"https://chatmbr-bot.vercel.app/api/chat?query={encoded_query}"
+                                req = urllib.request.Request(
+                                    api_url, headers={"User-Agent": "Mozilla/5.0"}
+                                )
+                                with urllib.request.urlopen(req, timeout=8) as api_response:
+                                    api_reply = api_response.read().decode("utf-8").strip()
 
-                        elif lower_msg in ["!discord", "!disc"]:
-                            discord_link = "https://discord.gg/"
-                            sendReplyToLiveChat(
-                                liveChatId,
-                                f"Join our discord! {discord_link}"
-                            )
-                            last_reply_time = time.time()
+                                if len(api_reply) > 200:
+                                    api_reply = api_reply[:197] + "..."
 
-                        elif lower_msg in ["!random", "!rand"]:
-                            dad_jokes = [
-                                "Why do fathers take an extra pair of socks when they go golfing? In case they get a hole in one!",
-                                "Dear Math, grow up and solve your own problems.",
-                                "What has more letters than the alphabet? The post office!",
-                                "Why are elevator jokes so classic and good? They work on so many levels!",
-                                "What do you call a fake noodle? An impasta!",
-                                "What do you call a belt made out of watches? A waist of time!",
-                                "Why did the scarecrow win an award? Because he was outstanding in his field!",
-                                "Why don't skeletons ever go trick or treating? Because they have no body to go with!",
-                                "What's brown and sticky? A stick!"
-                            ]
-                            joke = random.choice(dad_jokes)
-                            sendReplyToLiveChat(liveChatId, joke)
-                            last_reply_time = time.time()
-
-                        elif lower_msg.startswith("!chatmbr"):
-                            query = message_text[8:].strip()
-                            if not query:
+                                sendReplyToLiveChat(liveChatId, api_reply)
+                                last_reply_time = time.time()
+                            except Exception as e:
+                                print(f"Error fetching from ChatMBR API: {e}")
                                 sendReplyToLiveChat(
-                                    liveChatId,
-                                    f"@{userName} Please provide a query! Usage: !chatmbr <question>"
+                                    liveChatId, f"{userName} Unable to reach ChatMBR right now."
                                 )
                                 last_reply_time = time.time()
-                            else:
-                                try:
-                                    encoded_query = urllib.parse.quote(query)
-                                    api_url = f"https://chatmbr-bot.vercel.app/api/chat?query={encoded_query}"
-                                    req = urllib.request.Request(
-                                        api_url, headers={"User-Agent": "Mozilla/5.0"}
-                                    )
-                                    with urllib.request.urlopen(req, timeout=8) as api_response:
-                                        api_reply = api_response.read().decode("utf-8").strip()
 
-                                    # Truncate reply to avoid YouTube's 200-character chat limit
-                                    if len(api_reply) > 200:
-                                        api_reply = api_reply[:197] + "..."
-
-                                    sendReplyToLiveChat(liveChatId, api_reply)
-                                    last_reply_time = time.time()
-                                except Exception as e:
-                                    print(f"Error fetching from MBR API: {e}")
-                                    sendReplyToLiveChat(
-                                        liveChatId, f"@{userName} Unable to reach MBR right now."
-                                    )
-                                    last_reply_time = time.time()
-
-            # Prevent memory build-up without losing recent message history
-            if len(processed_message_ids) > 1000:
-                processed_message_ids = set(list(processed_message_ids)[-500:])
-
-            time.sleep(polling_interval)
+            time.sleep(1)
 
         except HttpError as e:
             if e.resp.status == 403 and "quotaExceeded" in str(e):
-                print("CRITICAL: YouTube API Daily Quota Exceeded! Sleeping for 1 hour to prevent crash loops...")
+                print("CRITICAL: YouTube API Daily Quota Exceeded! Sleeping for 1 hour...")
                 time.sleep(3600)
             else:
                 print(f"YouTube API Error: {e}")
                 time.sleep(10)
         except Exception as e:
-            print(f"Error reading chat: {e}")
+            print(f"Error reading pytchat stream: {e}")
             time.sleep(5)
 
 
