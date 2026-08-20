@@ -31,7 +31,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
             log_entries = "".join([f"<li>{item}</li>" for item in reversed(chat_logs)])
-            
+
             html_content = f"""
             <!DOCTYPE html>
             <html>
@@ -174,7 +174,7 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
 
     elif lower_msg.startswith(("!chatmbr", "!ai")):
         query = message_text[8:].strip() if lower_msg.startswith("!chatmbr") else message_text[3:].strip()
-            
+
         if not query:
             sendReplyToLiveChat(liveChatId, f"{userName} Please provide a query! Usage: !chatmbr <question> or !ai <question>")
             return time.time()
@@ -216,6 +216,9 @@ def main():
     next_page_token = None
     chat = None
 
+    last_pytchat_retry = 0
+    PYTCHAT_RETRY_INTERVAL = 300  # Attempt pytchat reconnection every 5 minutes
+
     add_log("Connecting pytchat listener (0 quota cost)...")
     try:
         chat = pytchat.create(video_id=LIVE_STREAM_ID)
@@ -228,11 +231,28 @@ def main():
 
     while True:
         try:
-            # --- MODE 1: pytchat ---
+            current_time = time.time()
+
+            # --- AUTO-RECOVERY: Periodically try restoring pytchat if in fallback mode ---
+            if use_api_fallback and (current_time - last_pytchat_retry > PYTCHAT_RETRY_INTERVAL):
+                add_log("Attempting to restore pytchat connection...")
+                last_pytchat_retry = current_time
+                try:
+                    test_chat = pytchat.create(video_id=LIVE_STREAM_ID)
+                    if test_chat.is_alive():
+                        chat = test_chat
+                        use_api_fallback = False
+                        add_log("Successfully reconnected pytchat! Exiting API Fallback Mode (0 quota active).")
+                        continue
+                except Exception as e:
+                    add_log(f"Pytchat reconnection attempt failed ({e}). Remaining on Backup API.")
+
+            # --- MODE 1: pytchat (0 Quota) ---
             if not use_api_fallback:
                 if not chat or not chat.is_alive():
                     add_log("Pytchat stream disconnected. Switching to Backup Project API Fallback Mode...")
                     use_api_fallback = True
+                    last_pytchat_retry = time.time()
                     continue
 
                 for msg_item in chat.get().sync_items():
@@ -266,17 +286,19 @@ def main():
                         last_reply_time, BLOCKED_BOTS, COOLDOWN_SECONDS
                     )
 
-                time.sleep(max(polling_millis / 1000.0, 5.0))
+                # Polling interval forced to at least 10 seconds to conserve backup quota
+                time.sleep(max(polling_millis / 1000.0, 10.0))
 
         except HttpError as e:
             if e.resp.status == 403 and "quotaExceeded" in str(e):
-                add_log("CRITICAL: Backup YouTube API Daily Quota Exceeded! Sleeping for 1 hour...")
-                time.sleep(3600)
+                add_log("CRITICAL: Backup YouTube API Quota Exceeded! Sleeping 15 mins before retrying pytchat...")
+                time.sleep(900)
+                last_pytchat_retry = 0  # Forces immediate pytchat check after waking up
             else:
                 add_log(f"YouTube API Error: {e}")
                 time.sleep(10)
         except Exception as e:
-            add_log(f"Error in chat loop ({e}). Switching/staying on Backup API Fallback...")
+            add_log(f"Error in chat loop ({e}). Staying on Backup API Fallback...")
             use_api_fallback = True
             time.sleep(5)
 
