@@ -218,6 +218,7 @@ def main():
 
     last_pytchat_retry = 0
     PYTCHAT_RETRY_INTERVAL = 300  # Attempt pytchat reconnection every 5 minutes
+    pytchat_failed_attempts = 0   # Track strikes before triggering fallback
 
     add_log("Connecting pytchat listener (0 quota cost)...")
     try:
@@ -242,6 +243,8 @@ def main():
                     if test_chat.is_alive():
                         chat = test_chat
                         use_api_fallback = False
+                        pytchat_failed_attempts = 0
+                        next_page_token = None
                         add_log("Successfully reconnected pytchat! Exiting API Fallback Mode (0 quota active).")
                         continue
                 except Exception as e:
@@ -250,10 +253,21 @@ def main():
             # --- MODE 1: pytchat (0 Quota) ---
             if not use_api_fallback:
                 if not chat or not chat.is_alive():
-                    add_log("Pytchat stream disconnected. Switching to Backup Project API Fallback Mode...")
-                    use_api_fallback = True
-                    last_pytchat_retry = time.time()
+                    pytchat_failed_attempts += 1
+                    add_log(f"Pytchat connection check failed ({pytchat_failed_attempts}/3)...")
+
+                    if pytchat_failed_attempts >= 3:
+                        add_log("Pytchat failed 3 consecutive times. Switching to Backup API Fallback...")
+                        use_api_fallback = True
+                        pytchat_failed_attempts = 0
+                        next_page_token = None  # Force anchor on next API fallback start
+                        last_pytchat_retry = time.time()
+
+                    time.sleep(2)
                     continue
+
+                # Reset strikes on a healthy stream connection
+                pytchat_failed_attempts = 0
 
                 for msg_item in chat.get().sync_items():
                     userName = msg_item.author.name
@@ -268,9 +282,23 @@ def main():
 
             # --- MODE 2: Backup YouTube API Fallback ---
             else:
-                request_args = {"liveChatId": liveChatId, "part": "snippet,authorDetails"}
-                if next_page_token:
-                    request_args["pageToken"] = next_page_token
+                # STEP 1: Skip historical messages on first request by grabbing initial token
+                if not next_page_token:
+                    response = youtube_backup.liveChatMessages().list(
+                        liveChatId=liveChatId,
+                        part="snippet"
+                    ).execute()
+                    next_page_token = response.get('nextPageToken')
+                    add_log("Anchored YouTube API to live edge (skipped historical chat history).")
+                    time.sleep(5)
+                    continue
+
+                # STEP 2: Pull only NEW incoming live chat messages
+                request_args = {
+                    "liveChatId": liveChatId,
+                    "part": "snippet,authorDetails",
+                    "pageToken": next_page_token
+                }
 
                 response = youtube_backup.liveChatMessages().list(**request_args).execute()
                 next_page_token = response.get('nextPageToken')
@@ -286,14 +314,15 @@ def main():
                         last_reply_time, BLOCKED_BOTS, COOLDOWN_SECONDS
                     )
 
-                # Polling interval forced to at least 10 seconds to conserve backup quota
+                # Force polling to at least 10 seconds to save quota
                 time.sleep(max(polling_millis / 1000.0, 10.0))
 
         except HttpError as e:
             if e.resp.status == 403 and "quotaExceeded" in str(e):
                 add_log("CRITICAL: Backup YouTube API Quota Exceeded! Sleeping 15 mins before retrying pytchat...")
                 time.sleep(900)
-                last_pytchat_retry = 0  # Forces immediate pytchat check after waking up
+                last_pytchat_retry = 0  # Force immediate pytchat check on wake
+                next_page_token = None
             else:
                 add_log(f"YouTube API Error: {e}")
                 time.sleep(10)
