@@ -52,6 +52,41 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             </html>
             """
             self.wfile.write(html_content.encode("utf-8"))
+
+        elif self.path == "/commands":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+
+            html_content = """
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Bot Commands</title>
+                <style>
+                    body { background-color: #0d1117; color: #c9d1d9; font-family: monospace; padding: 20px; }
+                    h2 { color: #58a6ff; border-bottom: 1px solid #30363d; padding-bottom: 10px; }
+                    table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+                    th, td { text-align: left; padding: 10px; border-bottom: 1px solid #21262d; }
+                    th { color: #58a6ff; }
+                    code { background: #161b22; padding: 3px 6px; border-radius: 4px; color: #79c0ff; }
+                </style>
+            </head>
+            <body>
+                <h2>📜 Available Bot Commands</h2>
+                <table>
+                    <tr><th>Command</th><th>Description</th></tr>
+                    <tr><td><code>hello / hi / hey</code></td><td>Greets the user.</td></tr>
+                    <tr><td><code>!discord / !disc</code></td><td>Sends the Discord server invite link (Not working).</td></tr>
+                    <tr><td><code>!random / !rand</code></td><td>Tells a random joke.</td></tr>
+                    <tr><td><code>!chatmbr &lt;query&gt; / !ai &lt;query&gt;</code></td><td>Asks ChatMBR a question.</td></tr>
+                    <tr><td><code>!commands / !help</code></td><td>Displays this command list page.</td></tr>
+                </table>
+            </body>
+            </html>
+            """
+            self.wfile.write(html_content.encode("utf-8"))
+
         else:
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
@@ -134,7 +169,7 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
 
     lower_msg = message_text.lower()
     is_command = (
-        lower_msg in ["hello", "hi", "hey", "!discord", "!disc", "!random", "!rand"]
+        lower_msg in ["hello", "hi", "hey", "!discord", "!disc", "!random", "!rand", "!commands", "!help"]
         or lower_msg.startswith(("!chatmbr", "!ai"))
     )
 
@@ -170,6 +205,11 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
         ]
         joke = random.choice(dad_jokes)
         sendReplyToLiveChat(liveChatId, joke)
+        return time.time()
+
+    elif lower_msg in ["!commands", "!help"]:
+        cmd_url = "https://youtube-livestream-chatbot.onrender.com/commands"
+        sendReplyToLiveChat(liveChatId, f"{userName} -> The bot commands are available at {cmd_url}")
         return time.time()
 
     elif lower_msg.startswith(("!chatmbr", "!ai")):
