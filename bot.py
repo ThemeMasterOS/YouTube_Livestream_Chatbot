@@ -169,7 +169,7 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
 
     lower_msg = message_text.lower()
     is_command = (
-        lower_msg in ["hello", "hi", "hey", "!discord", "!disc", "!random", "!rand", "!commands", "!help"]
+        lower_msg in ["hello", "hi", "hey", "!revertical", "!random", "!rand", "!commands", "!help"]
         or lower_msg.startswith(("!chatmbr", "!ai"))
     )
 
