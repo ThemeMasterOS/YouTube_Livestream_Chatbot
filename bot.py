@@ -217,7 +217,7 @@ def main():
     chat = None
 
     last_pytchat_retry = 0
-    PYTCHAT_RETRY_INTERVAL = 300  # Attempt pytchat reconnection every 5 minutes
+    PYTCHAT_RETRY_INTERVAL = 180  # Retries pytchat every 3 minutes
     pytchat_failed_attempts = 0   # Track strikes before triggering fallback
 
     add_log("Connecting pytchat listener (0 quota cost)...")
