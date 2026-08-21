@@ -77,7 +77,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                 <table>
                     <tr><th>Command</th><th>Description</th></tr>
                     <tr><td><code>hello / hi / hey</code></td><td>Greets the user.</td></tr>
-                    <tr><td><code>!discord / !disc</code></td><td>Sends the Discord server invite link (Not working).</td></tr>
+                    <tr><td><code>!revertical</code></td><td>dawg WHO said “revertical” 😭✌️</td></tr>
                     <tr><td><code>!random / !rand</code></td><td>Tells a random joke.</td></tr>
                     <tr><td><code>!chatmbr &lt;query&gt; / !ai &lt;query&gt;</code></td><td>Asks ChatMBR a question.</td></tr>
                     <tr><td><code>!commands / !help</code></td><td>Displays this command list page.</td></tr>
@@ -186,9 +186,8 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
         sendReplyToLiveChat(liveChatId, f"Hey {userName}! Welcome to the stream!")
         return time.time()
 
-    elif lower_msg in ["!discord", "!disc"]:
-        discord_link = "https://discord.gg/9tADYVHc3Y"
-        sendReplyToLiveChat(liveChatId, f"Join our discord! {discord_link}")
+    elif lower_msg in ["!revertical"]:
+        sendReplyToLiveChat(liveChatId, f"dawg WHO said “revertical” 😭✌️")
         return time.time()
 
     elif lower_msg in ["!random", "!rand"]:
