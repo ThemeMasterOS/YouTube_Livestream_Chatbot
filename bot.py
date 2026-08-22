@@ -220,7 +220,7 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
         else:
             try:
                 encoded_query = urllib.parse.quote(query)
-                api_url = f"https://chatmbr-bot.vercel.app/api/chat?query={encoded_query}"
+                api_url = f"https://chatmbr-bot.vercel.app/api/chat?platform=YouTube&limit=200&query={encoded_query}"
                 req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
                 with urllib.request.urlopen(req, timeout=8) as api_response:
                     api_reply = api_response.read().decode("utf-8").strip()
