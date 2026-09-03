@@ -729,7 +729,7 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
         return time.time()
 
     elif lower_msg in ["!commands", "!help"]:
-        cmd_url = "https://youtube-livestream-chatbot.onrender.com/commands"
+        cmd_url = "https://thememasteros.pythonanywhere.com/commands"
         sendReplyToLiveChat(liveChatId, f"{userName} -> The bot commands are available at {cmd_url}")
         return time.time()
 
