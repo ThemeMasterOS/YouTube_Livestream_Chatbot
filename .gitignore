@@ -1,0 +1,35 @@
+# Environment variables
+.env
+.env.local
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local channel configuration
+streams_config.json
+
+# Credentials (IMPORTANT!)
+client_secret.json
+token.json
+backup_client_secret.json
+backup_token.json
+backup2_client_secret.json
+backup2_token.json
