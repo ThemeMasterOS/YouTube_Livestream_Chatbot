@@ -346,7 +346,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                     <tr><td><code>!gamble &lt;number&gt;</code></td><td>Bets that many NeilCoins — 50/50 chance to double it or lose it.</td></tr>
                     <tr><td><code>!giftpoint @Username &lt;points&gt;</code></td><td>Gifts NeilCoins to another user (can't gift yourself).</td></tr>
                     <tr><td><code>!resetcoins</code></td><td>Grants +25 NeilCoins, but only if your balance is exactly 0. Max 3 uses ever.</td></tr>
-                    <tr><td><code>!leaderboard</code></td><td>Shows the top 5 users by NeilCoins.</td></tr>
+                    <tr><td><code>!leaderboard</code></td><td>Links to the <code>/leaderboard</code> page (top 50 users by NeilCoins).</td></tr>
                 </table>
             </body>
             </html>
@@ -526,6 +526,66 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                         }});
                     }}
                 </script>
+            </body>
+            </html>
+            """
+            self.wfile.write(html_content.encode("utf-8"))
+
+        elif self.path == "/leaderboard":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+
+            coins = load_coins()
+            ranked = sorted(coins.values(), key=lambda r: r.get('balance', 0), reverse=True)[:50]
+
+            medal_for_rank = {1: "🥇", 2: "🥈", 3: "🥉"}
+            leaderboard_rows = ""
+            for i, record in enumerate(ranked, start=1):
+                medal = medal_for_rank.get(i, f"#{i}")
+                name = record.get('name', 'Unknown')
+                balance = record.get('balance', 0)
+                resets = record.get('resetcoins_uses', 0)
+                leaderboard_rows += f"""
+                <tr>
+                    <td>{medal}</td>
+                    <td>{name}</td>
+                    <td>{balance:,}</td>
+                    <td>{resets}/{RESETCOINS_MAX_USES}</td>
+                </tr>
+                """
+
+            html_content = f"""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>NeilCoins Leaderboard</title>
+                <meta http-equiv="refresh" content="30">
+                <style>
+                    body {{ background-color: #0d1117; color: #c9d1d9; font-family: sans-serif; padding: 20px; }}
+                    h2 {{ color: #d29922; border-bottom: 1px solid #30363d; padding-bottom: 10px; }}
+                    .container {{ max-width: 700px; margin: 0 auto; }}
+                    table {{ width: 100%; border-collapse: collapse; margin-top: 15px; }}
+                    th, td {{ text-align: left; padding: 12px; border-bottom: 1px solid #21262d; }}
+                    th {{ color: #d29922; background: #161b22; }}
+                    tr:first-child td {{ font-weight: bold; }}
+                    p.note {{ color: #8b949e; font-size: 13px; }}
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h2>🏆 NeilCoins Leaderboard</h2>
+                    <p class="note">Top {len(ranked)} user(s) shown. New viewers start with {DEFAULT_STARTING_COINS} NeilCoins. Auto-refreshes every 30 seconds.</p>
+                    <table>
+                        <tr>
+                            <th>Rank</th>
+                            <th>User</th>
+                            <th>NeilCoins</th>
+                            <th>Resets Used</th>
+                        </tr>
+                        {leaderboard_rows or "<tr><td colspan='4'>No NeilCoins data yet.</td></tr>"}
+                    </table>
+                </div>
             </body>
             </html>
             """
@@ -831,7 +891,11 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
             save_coins(coins)
             return time.time()
 
-        # Search existing JSON records by stripping `@` from stored names to ensure a hit
+        # Only gift to users who already have a real account (i.e. they've
+        # chatted at least once, tied to an actual channel ID). This closes
+        # an exploit where !giftpoint could conjure a brand-new coin account
+        # for any typed name — including names nobody could ever claim —
+        # effectively creating coins out of thin air.
         target_key = None
         for key, rec in coins.items():
             stored_name_clean = rec.get('name', '').lstrip('@').strip().lower()
@@ -839,13 +903,11 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
                 target_key = key
                 break
 
-        # If user isn't found in the database, refuse to create a dummy account and exit!
         if target_key is None:
-            sendReplyToLiveChat(liveChatId, f"{userName} Couldn't find a user named '{target_raw}'. They must use !gamble or !coins first!")
+            sendReplyToLiveChat(liveChatId, f"{userName} Couldn't find a user named '{target_raw}'. They must send !gamble or !coins first!")
             save_coins(coins)
             return time.time()
 
-        # Credit the found existing account
         target_record = coins[target_key]
 
         sender_record['balance'] -= gift_amount
@@ -858,7 +920,7 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
     elif lower_msg == "!resetcoins":
         coins = load_coins()
         user_key = make_user_key(userName, userChannelId)
-        record = get_user_record(coins, user_key, display_name=userName)
+        record = get_user_record(coins, user_key)
 
         if record['balance'] != 0:
             sendReplyToLiveChat(liveChatId, f"{userName} !resetcoins only works when your balance is exactly 0 (you have {record['balance']}).")
@@ -879,16 +941,9 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
         return time.time()
 
     elif lower_msg == "!leaderboard":
-        coins = load_coins()
-        if not coins:
-            sendReplyToLiveChat(liveChatId, "No NeilCoins data yet — be the first to !gamble or check !coins!")
-            return time.time()
-
-        top_5 = sorted(coins.values(), key=lambda r: r.get('balance', 0), reverse=True)[:5]
-        leaderboard_str = " | ".join(
-            f"{i+1}. {r['name']}: {r['balance']}" for i, r in enumerate(top_5)
-        )
-        sendReplyToLiveChat(liveChatId, f"🏆 NeilCoins Leaderboard — {leaderboard_str}")
+        leaderboard_url = "https://youtube-livestream-chatbot.onrender.com/leaderboard"
+        sendReplyToLiveChat(liveChatId, f"{userName} -> The leaderboard is available at {leaderboard_url}")
+        return time.time()
         return time.time()
 
     return last_reply_time
