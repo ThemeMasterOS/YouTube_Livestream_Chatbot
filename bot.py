@@ -8,6 +8,8 @@ import urllib.parse
 import urllib.request
 import urllib.error
 import base64
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from collections import deque
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from googleapiclient.discovery import build
@@ -57,6 +59,16 @@ COINS_FILE = "coins_config.json"
 DEFAULT_STARTING_COINS = 100
 RESETCOINS_GRANT = 25
 RESETCOINS_MAX_USES = 3
+
+# --- Moderation Storage ---
+MODERATION_FILE = "moderation_config.json"
+DEFAULT_SPAM_THRESHOLD = 3
+DEFAULT_TIMEOUT_SECONDS = 300
+DEFAULT_TIMEOUT_MESSAGE = "{userName}, you have been timed out for {duration} for spamming."
+DEFAULT_REMINDER_MESSAGE = "{userName}, reminder: please don't spam."
+DEFAULT_BLOCKLIST_TIMEOUT_MESSAGE = "{userName}, you have been timed out for {duration} for saying bad words."
+DEFAULT_BLOCKLIST_REMINDER_MESSAGE = "{userName}, reminder: don't say bad words."
+MOD_REQUEST_MESSAGE = "Hey, can you add @ThemeMasterBot as a moderator? I can time out viewers who spam or use blocked words."
 
 # --- GitHub-backed persistence ---
 # Render's free tier wipes local disk on every cold-start and redeploy.
@@ -228,6 +240,79 @@ def get_user_record(coins, user_key, display_name=None):
     return coins[user_key]
 
 
+# --- Moderation helpers ---
+
+def _default_stream_moderation():
+    return {
+        "enabled": False,
+        "spam_threshold": DEFAULT_SPAM_THRESHOLD,
+        "timeout_seconds": DEFAULT_TIMEOUT_SECONDS,
+        "timeout_message": DEFAULT_TIMEOUT_MESSAGE,
+        "reminder_message": DEFAULT_REMINDER_MESSAGE,
+    }
+
+
+def _default_blocklist_category(name=""):
+    return {
+        "name": name,
+        "words": [],
+        "timeout_seconds": DEFAULT_TIMEOUT_SECONDS,
+        "timeout_message": DEFAULT_BLOCKLIST_TIMEOUT_MESSAGE,
+        "reminder_message": DEFAULT_BLOCKLIST_REMINDER_MESSAGE,
+    }
+
+
+def load_moderation():
+    config = load_json_with_fallback(MODERATION_FILE, "moderation setting(s)")
+    # Backfill structure for a fresh/empty file so callers can rely on these keys existing.
+    if "blocklist_categories" not in config:
+        config["blocklist_categories"] = {}
+    if "streams" not in config:
+        config["streams"] = {}
+    if "all_streams" not in config:
+        config["all_streams"] = _default_stream_moderation()
+    return config
+
+
+def save_moderation(config):
+    save_json_with_backup(MODERATION_FILE, config, "moderation settings")
+
+
+def get_stream_moderation_settings(config, video_id):
+    """
+    Returns the effective spam-moderation settings for a given stream: its
+    per-stream config if one exists and is enabled, otherwise the
+    "All streams" config (only if enabled), otherwise None (spam detection
+    inactive for this stream). Blocklist categories are checked separately
+    via check_blocklist_categories() since they're global and independent
+    of this enabled/disabled toggle.
+    """
+    per_stream = config.get("streams", {}).get(video_id)
+    if per_stream and per_stream.get("enabled"):
+        return per_stream
+
+    all_streams = config.get("all_streams", {})
+    if all_streams.get("enabled"):
+        return all_streams
+
+    return None
+
+
+def check_blocklist_categories(config, lower_msg):
+    """
+    Checks a lowercased message against every blocklist category (global,
+    applies to all streams). Returns the first matching category's settings
+    dict, or None if no category matches. Categories are checked in
+    insertion order; the first match wins if a message happens to match
+    words from more than one category.
+    """
+    for category in config.get("blocklist_categories", {}).values():
+        for bad_word in category.get("words", []):
+            if bad_word and bad_word.lower() in lower_msg:
+                return category
+    return None
+
+
 def make_user_key(userName, userChannelId):
     """Prefer the stable channel ID; fall back to lowercased name if absent."""
     if userChannelId:
@@ -243,6 +328,29 @@ def add_log(message):
     entry = f"{utc_timestamp} {message}"
     chat_logs.append(entry)
     print(entry, flush=True)
+
+
+def seconds_until_next_midnight_pt():
+    """
+    Returns (seconds_to_wait, utc_offset_label) for the next 00:00 Pacific
+    Time — i.e. YouTube's daily quota reset. Uses zoneinfo so the correct
+    PDT (UTC-7) vs PST (UTC-8) offset is derived from today's actual date,
+    not hardcoded — this stays correct automatically across DST transitions.
+    """
+    pt_zone = ZoneInfo("America/Los_Angeles")
+    now_pt = datetime.now(pt_zone)
+
+    next_midnight_pt = (now_pt + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+
+    seconds_to_wait = (next_midnight_pt - now_pt).total_seconds()
+
+    # UTC offset for Pacific Time at that moment (-7 during PDT, -8 during PST)
+    utc_offset_hours = int(-next_midnight_pt.utcoffset().total_seconds() / 3600)
+    utc_offset_label = f"{utc_offset_hours:02d}:00"
+
+    return seconds_to_wait, utc_offset_label
 
 
 # --- Global thread-safe tracking of which video IDs currently have an
@@ -272,13 +380,26 @@ def start_stream_listener(video_id, label):
 
 
 def stop_stream_listener(video_id):
-    """Signal a running listener thread for this video_id to stop."""
+    """Signal a running listener thread for this video_id to stop (used by the /live Remove button)."""
     with active_streams_lock:
         flag = stop_flags.get(video_id)
         if flag:
             flag.set()
         active_stream_ids.discard(video_id)
         stop_flags.pop(video_id, None)
+
+
+def mark_stream_stopped(video_id):
+    """
+    Called by a listener thread on itself when it exits naturally (stream
+    ended, too many API errors) rather than via the /live Remove button.
+    Removes it from active_stream_ids so /live correctly shows ⚪ Stopped
+    instead of leaving it stuck on 🟢 Listening for a thread that's already
+    dead. Does NOT touch stop_flags — Remove button cleanup already
+    handles that path separately, and this only runs for self-ended threads.
+    """
+    with active_streams_lock:
+        active_stream_ids.discard(video_id)
 
 
 # --- Render Port Binding & HTTP Server ---
@@ -346,7 +467,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                     <tr><td><code>!gamble &lt;number&gt;</code></td><td>Bets that many NeilCoins — 50/50 chance to double it or lose it.</td></tr>
                     <tr><td><code>!giftpoint @Username &lt;points&gt;</code></td><td>Gifts NeilCoins to another user (can't gift yourself).</td></tr>
                     <tr><td><code>!resetcoins</code></td><td>Grants +25 NeilCoins, but only if your balance is exactly 0. Max 3 uses ever.</td></tr>
-                    <tr><td><code>!leaderboard</code></td><td>Shows the top 5 users by NeilCoins.</td></tr>
+                    <tr><td><code>!leaderboard</code></td><td>Links to the <code>/leaderboard</code> page (top 50 users by NeilCoins).</td></tr>
                 </table>
             </body>
             </html>
@@ -531,6 +652,275 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             """
             self.wfile.write(html_content.encode("utf-8"))
 
+        elif self.path == "/leaderboard":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+
+            coins = load_coins()
+            ranked = sorted(coins.values(), key=lambda r: r.get('balance', 0), reverse=True)[:50]
+
+            medal_for_rank = {1: "🥇", 2: "🥈", 3: "🥉"}
+            leaderboard_rows = ""
+            for i, record in enumerate(ranked, start=1):
+                medal = medal_for_rank.get(i, f"#{i}")
+                name = record.get('name', 'Unknown')
+                balance = record.get('balance', 0)
+                resets = record.get('resetcoins_uses', 0)
+                leaderboard_rows += f"""
+                <tr>
+                    <td>{medal}</td>
+                    <td>{name}</td>
+                    <td>{balance:,}</td>
+                    <td>{resets}/{RESETCOINS_MAX_USES}</td>
+                </tr>
+                """
+
+            html_content = f"""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>NeilCoins Leaderboard</title>
+                <meta http-equiv="refresh" content="30">
+                <style>
+                    body {{ background-color: #0d1117; color: #c9d1d9; font-family: sans-serif; padding: 20px; }}
+                    h2 {{ color: #d29922; border-bottom: 1px solid #30363d; padding-bottom: 10px; }}
+                    .container {{ max-width: 700px; margin: 0 auto; }}
+                    table {{ width: 100%; border-collapse: collapse; margin-top: 15px; }}
+                    th, td {{ text-align: left; padding: 12px; border-bottom: 1px solid #21262d; }}
+                    th {{ color: #d29922; background: #161b22; }}
+                    tr:first-child td {{ font-weight: bold; }}
+                    p.note {{ color: #8b949e; font-size: 13px; }}
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h2>🏆 NeilCoins Leaderboard</h2>
+                    <p class="note">Top {len(ranked)} user(s) shown. New viewers start with {DEFAULT_STARTING_COINS} NeilCoins. Auto-refreshes every 30 seconds.</p>
+                    <table>
+                        <tr>
+                            <th>Rank</th>
+                            <th>User</th>
+                            <th>NeilCoins</th>
+                            <th>Resets Used</th>
+                        </tr>
+                        {leaderboard_rows or "<tr><td colspan='4'>No NeilCoins data yet.</td></tr>"}
+                    </table>
+                </div>
+            </body>
+            </html>
+            """
+            self.wfile.write(html_content.encode("utf-8"))
+
+        elif self.path == "/moderation":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+
+            config = load_moderation()
+            streams = load_streams()
+            with active_streams_lock:
+                running_ids = set(active_stream_ids)
+
+            all_streams_settings = config.get("all_streams", _default_stream_moderation())
+
+            stream_rows = ""
+            for video_id, data in streams.items():
+                if video_id not in running_ids:
+                    continue  # Only currently-listening streams can be moderated
+                label = data.get('label') or video_id
+                settings = config.get("streams", {}).get(video_id, _default_stream_moderation())
+                checked = "checked" if settings.get("enabled") else ""
+                stream_rows += f"""
+                <tr>
+                    <td>{label}<br><code style="font-size:11px;color:#8b949e;">{video_id}</code></td>
+                    <td><input type="checkbox" class="mod-enabled" data-video-id="{video_id}" {checked}></td>
+                    <td><input type="number" class="mod-threshold" data-video-id="{video_id}" value="{settings.get('spam_threshold', DEFAULT_SPAM_THRESHOLD)}" min="1" style="width:60px;"></td>
+                    <td><input type="number" class="mod-duration" data-video-id="{video_id}" value="{settings.get('timeout_seconds', DEFAULT_TIMEOUT_SECONDS)}" min="1" style="width:80px;"> sec</td>
+                    <td><textarea class="mod-timeout-msg" data-video-id="{video_id}" style="min-height:40px;">{settings.get('timeout_message', DEFAULT_TIMEOUT_MESSAGE)}</textarea></td>
+                    <td><textarea class="mod-reminder-msg" data-video-id="{video_id}" style="min-height:40px;">{settings.get('reminder_message', DEFAULT_REMINDER_MESSAGE)}</textarea></td>
+                    <td><button class="save-btn" onclick="saveStreamSettings('{video_id}')">Save</button></td>
+                </tr>
+                """
+
+            blocklist_category_boxes = ""
+            for cat_id, category in config.get("blocklist_categories", {}).items():
+                words_text = ", ".join(category.get("words", []))
+                blocklist_category_boxes += f"""
+                <div class="box" data-category-id="{cat_id}">
+                    <label>Category name</label>
+                    <input type="text" class="cat-name" value="{category.get('name', '')}">
+                    <label>Blocked words/phrases (comma-separated)</label>
+                    <textarea class="cat-words">{words_text}</textarea>
+                    <label>Timeout duration (seconds)</label>
+                    <input type="number" class="cat-duration" value="{category.get('timeout_seconds', DEFAULT_TIMEOUT_SECONDS)}" min="1">
+                    <label>Timeout message (use {{userName}} and {{duration}})</label>
+                    <textarea class="cat-timeout-msg">{category.get('timeout_message', DEFAULT_BLOCKLIST_TIMEOUT_MESSAGE)}</textarea>
+                    <label>Reminder message (use {{userName}})</label>
+                    <textarea class="cat-reminder-msg">{category.get('reminder_message', DEFAULT_BLOCKLIST_REMINDER_MESSAGE)}</textarea>
+                    <button class="save-btn" onclick="saveBlocklistCategory('{cat_id}')">Save Category</button>
+                    <button class="delete-btn" onclick="deleteBlocklistCategory('{cat_id}')">Delete Category</button>
+                </div>
+                """
+
+            html_content = f"""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Moderation Settings</title>
+                <style>
+                    body {{ background-color: #0d1117; color: #c9d1d9; font-family: sans-serif; padding: 20px; }}
+                    h2 {{ color: #f85149; border-bottom: 1px solid #30363d; padding-bottom: 10px; }}
+                    h3 {{ color: #58a6ff; margin-top: 0; }}
+                    .container {{ max-width: 1000px; margin: 0 auto; }}
+                    .box {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 20px; margin-bottom: 20px; }}
+                    table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
+                    th, td {{ text-align: left; padding: 10px; border-bottom: 1px solid #21262d; font-size: 13px; vertical-align: top; }}
+                    th {{ color: #58a6ff; }}
+                    input[type="text"], textarea {{ width: 100%; padding: 8px; background: #0d1117; border: 1px solid #30363d; color: #c9d1d9; border-radius: 4px; box-sizing: border-box; font-family: monospace; font-size: 13px; }}
+                    input[type="number"] {{ padding: 6px; background: #0d1117; border: 1px solid #30363d; color: #c9d1d9; border-radius: 4px; }}
+                    textarea {{ min-height: 60px; margin-bottom: 8px; }}
+                    button {{ padding: 8px 16px; cursor: pointer; border: 1px solid #30363d; border-radius: 6px; background: #21262d; color: #58a6ff; margin-right: 8px; }}
+                    button:hover {{ background: #30363d; }}
+                    .save-btn {{ background: #238636; color: white; font-weight: bold; }}
+                    .save-btn:hover {{ background: #2ea043; }}
+                    .add-btn {{ background: #1f6feb; color: white; font-weight: bold; }}
+                    .add-btn:hover {{ background: #1a5cc4; }}
+                    .delete-btn {{ background: #8b1a1a; color: white; }}
+                    .delete-btn:hover {{ background: #a52a2a; }}
+                    label {{ display: block; margin-top: 10px; margin-bottom: 4px; color: #8b949e; font-size: 13px; }}
+                    .note {{ color: #8b949e; font-size: 13px; }}
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h2>🛡️ Moderation Settings</h2>
+
+                    <div class="box">
+                        <h3>🚫 Blocklist Categories (global — applies to all streams)</h3>
+                        <p class="note">Each category has its own words, timeout duration, and messages. A message matching any word in any category triggers that category's reminder → timeout escalation.</p>
+                        <div id="blocklistCategories">
+                            {blocklist_category_boxes}
+                        </div>
+                        <button class="add-btn" onclick="addBlocklistCategory()">+ Add Blocklist</button>
+                    </div>
+
+                    <div class="box">
+                        <h3>🌐 All Streams (default spam settings)</h3>
+                        <p class="note">When enabled, applies to every listening stream that doesn't have its own per-stream override below.</p>
+                        <label>Enabled</label>
+                        <input type="checkbox" id="allStreamsEnabled" {"checked" if all_streams_settings.get("enabled") else ""}>
+                        <label>Spam threshold (repeats in a row)</label>
+                        <input type="number" id="allStreamsThreshold" value="{all_streams_settings.get('spam_threshold', DEFAULT_SPAM_THRESHOLD)}" min="1">
+                        <label>Timeout duration (seconds)</label>
+                        <input type="number" id="allStreamsDuration" value="{all_streams_settings.get('timeout_seconds', DEFAULT_TIMEOUT_SECONDS)}" min="1">
+                        <label>Timeout message (use {{userName}} and {{duration}})</label>
+                        <textarea id="allStreamsTimeoutMsg">{all_streams_settings.get('timeout_message', DEFAULT_TIMEOUT_MESSAGE)}</textarea>
+                        <label>Reminder message (use {{userName}})</label>
+                        <textarea id="allStreamsReminderMsg">{all_streams_settings.get('reminder_message', DEFAULT_REMINDER_MESSAGE)}</textarea>
+                        <button class="save-btn" onclick="saveAllStreamsSettings()">Save All-Streams Settings</button>
+                    </div>
+
+                    <div class="box">
+                        <h3>📺 Per-Stream Spam Overrides</h3>
+                        <p class="note">Only currently-listening (🟢) streams are shown. A per-stream override, when enabled, takes priority over "All Streams" for that stream's spam detection.</p>
+                        <table>
+                            <tr>
+                                <th>Stream</th>
+                                <th>Enabled</th>
+                                <th>Spam threshold</th>
+                                <th>Timeout duration</th>
+                                <th>Timeout message</th>
+                                <th>Reminder message</th>
+                                <th>Actions</th>
+                            </tr>
+                            {stream_rows or "<tr><td colspan='7'>No currently-listening streams.</td></tr>"}
+                        </table>
+                    </div>
+                </div>
+
+                <script>
+                    function addBlocklistCategory() {{
+                        fetch('/api/moderation/blocklist-category', {{
+                            method: 'POST',
+                            headers: {{'Content-Type': 'application/json'}},
+                            body: JSON.stringify({{action: 'create'}})
+                        }}).then(r => r.json()).then(data => {{
+                            alert(data.message);
+                            location.reload();
+                        }});
+                    }}
+
+                    function saveBlocklistCategory(catId) {{
+                        const box = document.querySelector(`[data-category-id="${{catId}}"]`);
+                        const wordsRaw = box.querySelector('.cat-words').value;
+                        const words = wordsRaw.split(',').map(w => w.trim()).filter(w => w.length > 0);
+                        const body = {{
+                            action: 'update',
+                            category_id: catId,
+                            name: box.querySelector('.cat-name').value,
+                            words: words,
+                            timeout_seconds: parseInt(box.querySelector('.cat-duration').value) || {DEFAULT_TIMEOUT_SECONDS},
+                            timeout_message: box.querySelector('.cat-timeout-msg').value,
+                            reminder_message: box.querySelector('.cat-reminder-msg').value
+                        }};
+                        fetch('/api/moderation/blocklist-category', {{
+                            method: 'POST',
+                            headers: {{'Content-Type': 'application/json'}},
+                            body: JSON.stringify(body)
+                        }}).then(r => r.json()).then(data => alert(data.message));
+                    }}
+
+                    function deleteBlocklistCategory(catId) {{
+                        if (!confirm('Delete this blocklist category?')) return;
+                        fetch('/api/moderation/blocklist-category', {{
+                            method: 'POST',
+                            headers: {{'Content-Type': 'application/json'}},
+                            body: JSON.stringify({{action: 'delete', category_id: catId}})
+                        }}).then(r => r.json()).then(data => {{
+                            alert(data.message);
+                            location.reload();
+                        }});
+                    }}
+
+                    function saveAllStreamsSettings() {{
+                        const body = {{
+                            enabled: document.getElementById('allStreamsEnabled').checked,
+                            spam_threshold: parseInt(document.getElementById('allStreamsThreshold').value) || {DEFAULT_SPAM_THRESHOLD},
+                            timeout_seconds: parseInt(document.getElementById('allStreamsDuration').value) || {DEFAULT_TIMEOUT_SECONDS},
+                            timeout_message: document.getElementById('allStreamsTimeoutMsg').value,
+                            reminder_message: document.getElementById('allStreamsReminderMsg').value
+                        }};
+                        fetch('/api/moderation/all-streams', {{
+                            method: 'POST',
+                            headers: {{'Content-Type': 'application/json'}},
+                            body: JSON.stringify(body)
+                        }}).then(r => r.json()).then(data => alert(data.message));
+                    }}
+
+                    function saveStreamSettings(videoId) {{
+                        const row = document.querySelector(`[data-video-id="${{videoId}}"].mod-enabled`).closest('tr');
+                        const body = {{
+                            video_id: videoId,
+                            enabled: row.querySelector('.mod-enabled').checked,
+                            spam_threshold: parseInt(row.querySelector('.mod-threshold').value) || {DEFAULT_SPAM_THRESHOLD},
+                            timeout_seconds: parseInt(row.querySelector('.mod-duration').value) || {DEFAULT_TIMEOUT_SECONDS},
+                            timeout_message: row.querySelector('.mod-timeout-msg').value,
+                            reminder_message: row.querySelector('.mod-reminder-msg').value
+                        }};
+                        fetch('/api/moderation/stream', {{
+                            method: 'POST',
+                            headers: {{'Content-Type': 'application/json'}},
+                            headers: {{'Content-Type': 'application/json'}},
+                            body: JSON.stringify(body)
+                        }}).then(r => r.json()).then(data => alert(data.message));
+                    }}
+                </script>
+            </body>
+            </html>
+            """
+            self.wfile.write(html_content.encode("utf-8"))
+
         elif self.path.startswith("/api/streams"):
             if self.command == "GET":
                 self.send_response(200)
@@ -584,6 +974,115 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps({
                     "message": f"Stopped and removed {video_id}."
                 }).encode("utf-8"))
+
+        elif self.path == "/api/moderation/blocklist-category" and self.command == "POST":
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = json.loads(self.rfile.read(content_length).decode('utf-8'))
+            action = body.get("action", "")
+
+            config = load_moderation()
+            config.setdefault("blocklist_categories", {})
+
+            if action == "create":
+                import uuid
+                new_id = uuid.uuid4().hex[:8]
+                config["blocklist_categories"][new_id] = {
+                    "name": "New blocklist",
+                    "words": [],
+                    "timeout_seconds": DEFAULT_TIMEOUT_SECONDS,
+                    "timeout_message": DEFAULT_BLOCKLIST_TIMEOUT_MESSAGE,
+                    "reminder_message": DEFAULT_BLOCKLIST_REMINDER_MESSAGE,
+                }
+                save_moderation(config)
+                message = "New blocklist category created."
+
+            elif action == "update":
+                category_id = body.get("category_id", "")
+                if category_id not in config["blocklist_categories"]:
+                    self.send_response(404)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"message": "Category not found."}).encode("utf-8"))
+                    return
+                config["blocklist_categories"][category_id] = {
+                    "name": body.get("name", "Untitled"),
+                    "words": body.get("words", []),
+                    "timeout_seconds": int(body.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)),
+                    "timeout_message": body.get("timeout_message", DEFAULT_BLOCKLIST_TIMEOUT_MESSAGE),
+                    "reminder_message": body.get("reminder_message", DEFAULT_BLOCKLIST_REMINDER_MESSAGE),
+                }
+                save_moderation(config)
+                message = f"Blocklist category '{config['blocklist_categories'][category_id]['name']}' saved."
+
+            elif action == "delete":
+                category_id = body.get("category_id", "")
+                config["blocklist_categories"].pop(category_id, None)
+                save_moderation(config)
+                message = "Blocklist category deleted."
+
+            else:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"message": "Unknown action."}).encode("utf-8"))
+                return
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"message": message}).encode("utf-8"))
+
+        elif self.path == "/api/moderation/all-streams" and self.command == "POST":
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = json.loads(self.rfile.read(content_length).decode('utf-8'))
+
+            config = load_moderation()
+            existing = config.get("all_streams", _default_stream_moderation())
+            config["all_streams"] = {
+                "enabled": bool(body.get("enabled", False)),
+                "spam_threshold": int(body.get("spam_threshold", DEFAULT_SPAM_THRESHOLD)),
+                "timeout_seconds": int(body.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)),
+                "timeout_message": body.get("timeout_message", DEFAULT_TIMEOUT_MESSAGE),
+                "reminder_message": body.get("reminder_message", DEFAULT_REMINDER_MESSAGE),
+            }
+            save_moderation(config)
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "message": "All-streams moderation settings saved."
+            }).encode("utf-8"))
+
+        elif self.path == "/api/moderation/stream" and self.command == "POST":
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = json.loads(self.rfile.read(content_length).decode('utf-8'))
+
+            video_id = body.get("video_id", "").strip()
+            if not video_id:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"message": "video_id is required."}).encode("utf-8"))
+                return
+
+            config = load_moderation()
+            existing = config.get("streams", {}).get(video_id, _default_stream_moderation())
+            config.setdefault("streams", {})[video_id] = {
+                "enabled": bool(body.get("enabled", False)),
+                "spam_threshold": int(body.get("spam_threshold", DEFAULT_SPAM_THRESHOLD)),
+                "timeout_seconds": int(body.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)),
+                "timeout_message": body.get("timeout_message", existing.get("timeout_message", DEFAULT_TIMEOUT_MESSAGE)),
+                "reminder_message": body.get("reminder_message", existing.get("reminder_message", DEFAULT_REMINDER_MESSAGE)),
+            }
+            save_moderation(config)
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "message": f"Moderation settings saved for {video_id}."
+            }).encode("utf-8"))
 
         else:
             self.send_response(200)
@@ -644,11 +1143,19 @@ def getLiveChatId(LIVE_STREAM_ID):
     return liveChatId
 
 
-def sendReplyToLiveChat(liveChatId, message):
-    """Sends messages using youtube_main (Main project quota)."""
+def sendReplyToLiveChat(liveChatId, message, stream_name="?"):
+    """
+    Sends messages using youtube_main (Main project quota). YouTube's
+    response to this insert() call includes authorDetails for the bot's
+    own post — including isChatModerator/isChatOwner — so every successful
+    send doubles as a free, always-current mod-status check. This avoids
+    liveChatModerators().list(), which requires the calling account to BE
+    the channel owner and always 403s for a separate bot account, even
+    when that bot genuinely has moderator status.
+    """
     try:
         reply = youtube_main.liveChatMessages().insert(
-            part="snippet",
+            part="snippet,authorDetails",
             body={
                 "snippet": {
                     "liveChatId": liveChatId,
@@ -658,14 +1165,241 @@ def sendReplyToLiveChat(liveChatId, message):
                     }
                 }
             }
-        )
-        reply.execute()
-        add_log(f"Bot replied: {message}")
+        ).execute()
+        add_log(f"Bot replied in '{stream_name}': {message}")
+
+        author_details = reply.get("authorDetails", {})
+        is_mod = bool(author_details.get("isChatModerator") or author_details.get("isChatOwner"))
+        with _mod_status_cache_lock:
+            _mod_status_cache[liveChatId] = is_mod
     except Exception as e:
-        add_log(f"Failed to send message: {e}")
+        add_log(f"Failed to send message in '{stream_name}': {e}")
 
 
-def process_command(userName, userChannelId, message_text, liveChatId, last_reply_time, BLOCKED_BOTS, COOLDOWN_SECONDS):
+# --- Moderation: bot identity + moderator-status cache ---
+BOT_CHANNEL_ID = "UCFLh_LNE-OSPRl1rwxB48rQ"  # @ThemeMasterBot
+
+# liveChatId -> bool. Populated as a side effect of sendReplyToLiveChat()
+# reading its own message's authorDetails — NOT via a separate API call,
+# since liveChatModerators().list() requires the caller to be the channel
+# owner and will 403 for a bot account regardless of its real mod status.
+_mod_status_cache = {}
+_mod_status_cache_lock = threading.Lock()
+
+
+def is_bot_moderator(liveChatId):
+    """
+    Returns True/False if we already know (from a prior sendReplyToLiveChat
+    call on this liveChatId), or None if unknown yet — e.g. the bot hasn't
+    sent anything here yet this session. Callers should treat None as
+    "attempt the action and let its own success/failure decide", not as
+    "assume not a mod".
+    """
+    with _mod_status_cache_lock:
+        return _mod_status_cache.get(liveChatId)
+
+
+def timeoutUser(liveChatId, userChannelId, duration_seconds, stream_name="?"):
+    """
+    Times out a user from live chat for duration_seconds using
+    liveChatBans().insert(). Returns (success: bool, permission_denied: bool).
+    permission_denied is True specifically when the failure looks like the
+    bot lacking moderator status (HTTP 403 insufficientPermissions/forbidden)
+    — as opposed to some other failure (network error, invalid channel ID,
+    etc.) — so callers can tell "not a mod" apart from "something else broke".
+    """
+    try:
+        youtube_main.liveChatBans().insert(
+            part="snippet",
+            body={
+                "snippet": {
+                    "liveChatId": liveChatId,
+                    "type": "temporary",
+                    "banDurationSeconds": duration_seconds,
+                    "bannedUserDetails": {
+                        "channelId": userChannelId
+                    }
+                }
+            }
+        ).execute()
+        add_log(f"Timed out user (channel {userChannelId}) in '{stream_name}' for {duration_seconds}s.")
+        with _mod_status_cache_lock:
+            _mod_status_cache[liveChatId] = True  # A successful ban proves mod status
+        return True, False
+    except HttpError as e:
+        status = getattr(getattr(e, 'resp', None), 'status', None)
+        try:
+            reason = e.error_details if hasattr(e, 'error_details') else e.content.decode('utf-8', errors='replace')
+        except Exception:
+            reason = str(e) or repr(e)
+        add_log(f"Failed to time out user in '{stream_name}': HTTP {status} — {reason}")
+
+        permission_denied = status == 403
+        if permission_denied:
+            with _mod_status_cache_lock:
+                _mod_status_cache[liveChatId] = False
+        return False, permission_denied
+    except Exception as e:
+        add_log(f"Failed to time out user in '{stream_name}': {e}")
+        return False, False
+
+
+def format_duration(seconds):
+    """Human-readable duration for use in {duration} message placeholders."""
+    if seconds < 60:
+        return f"{seconds} second(s)"
+    minutes = seconds // 60
+    remaining = seconds % 60
+    if remaining == 0:
+        return f"{minutes} minute(s)"
+    return f"{minutes} minute(s) {remaining} second(s)"
+
+
+# --- Moderation: per-stream, per-user tracking state ---
+# _recent_messages[video_id][userChannelId] -> (last_message_text, repeat_count)
+# _offense_counts[video_id][userChannelId]  -> number of prior offenses (for escalation)
+# _last_mod_request_time[video_id]  -> timestamp of the last "add me as mod"
+#     message sent on this stream (per-stream cooldown, not once-ever).
+# _last_mod_owner_reminder_time[video_id] -> timestamp of the last reminder
+#     sent to a moderator/owner on this stream (per-stream cooldown).
+_recent_messages = {}
+_offense_counts = {}
+_last_mod_request_time = {}
+_last_mod_owner_reminder_time = {}
+_moderation_state_lock = threading.Lock()
+
+MOD_MESSAGE_COOLDOWN_SECONDS = 10
+
+
+def _send_mod_request(video_id, liveChatId, stream_name):
+    """
+    Sends MOD_REQUEST_MESSAGE, but at most once per MOD_MESSAGE_COOLDOWN_SECONDS
+    per stream — so repeated violations while the bot still isn't a mod
+    don't flood the chat, while still re-reminding periodically rather
+    than staying silent forever after the first send.
+    """
+    now = time.time()
+    with _moderation_state_lock:
+        last_sent = _last_mod_request_time.get(video_id, 0)
+        on_cooldown = (now - last_sent) < MOD_MESSAGE_COOLDOWN_SECONDS
+        if not on_cooldown:
+            _last_mod_request_time[video_id] = now
+
+    if not on_cooldown:
+        sendReplyToLiveChat(liveChatId, MOD_REQUEST_MESSAGE, stream_name=stream_name)
+
+
+def _send_mod_owner_reminder(video_id, liveChatId, stream_name, reminder_msg):
+    """
+    Sends a reminder to a moderator/owner who triggered a violation, at
+    most once per MOD_MESSAGE_COOLDOWN_SECONDS per stream — same cooldown
+    treatment as the mod-request message, so repeated mod/owner violations
+    (or several different mods in quick succession) don't flood the chat.
+    """
+    now = time.time()
+    with _moderation_state_lock:
+        last_sent = _last_mod_owner_reminder_time.get(video_id, 0)
+        on_cooldown = (now - last_sent) < MOD_MESSAGE_COOLDOWN_SECONDS
+        if not on_cooldown:
+            _last_mod_owner_reminder_time[video_id] = now
+
+    if not on_cooldown:
+        sendReplyToLiveChat(liveChatId, reminder_msg, stream_name=stream_name)
+
+
+def run_moderation_check(video_id, stream_name, liveChatId, userName, userChannelId, message_text, is_moderator, is_owner, recent_messages_unused=None):
+    """
+    Checks a single chat message against active moderation settings for
+    this stream: spam-repeat (per-stream settings) and blocklist categories
+    (global, independent of the per-stream enabled toggle). Applies the
+    reminder/timeout escalation using whichever violation type's own
+    duration and message templates apply. Called on every chat message,
+    not just bot commands.
+    """
+    config = load_moderation()
+    lower_msg = message_text.strip().lower()
+
+    # --- Check blocklist categories first (global, always active) ---
+    matched_category = check_blocklist_categories(config, lower_msg)
+
+    # --- Check spam-repeat (only if this stream has spam detection enabled) ---
+    spam_settings = get_stream_moderation_settings(config, video_id)
+    is_spam = False
+    if spam_settings is not None:
+        with _moderation_state_lock:
+            stream_recent = _recent_messages.setdefault(video_id, {})
+            last_text, repeat_count = stream_recent.get(userChannelId, (None, 0))
+
+            if lower_msg == last_text:
+                repeat_count += 1
+            else:
+                repeat_count = 1
+            stream_recent[userChannelId] = (lower_msg, repeat_count)
+
+        spam_threshold = spam_settings.get("spam_threshold", DEFAULT_SPAM_THRESHOLD)
+        if repeat_count >= spam_threshold:
+            is_spam = True
+
+    if matched_category is None and not is_spam:
+        return  # No violation of any kind
+
+    # A blocklist hit takes priority over spam if both somehow matched at
+    # once (e.g. someone spams a banned word) — its message/duration apply.
+    if matched_category is not None:
+        duration_seconds = matched_category.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)
+        timeout_template = matched_category.get("timeout_message", DEFAULT_BLOCKLIST_TIMEOUT_MESSAGE)
+        reminder_template = matched_category.get("reminder_message", DEFAULT_BLOCKLIST_REMINDER_MESSAGE)
+    else:
+        duration_seconds = spam_settings.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)
+        timeout_template = spam_settings.get("timeout_message", DEFAULT_TIMEOUT_MESSAGE)
+        reminder_template = spam_settings.get("reminder_message", DEFAULT_REMINDER_MESSAGE)
+
+    # --- Moderator/owner: reminder only (cooldown-limited), never escalates to a real timeout ---
+    if is_moderator or is_owner:
+        reminder_msg = reminder_template.format(userName=userName)
+        _send_mod_owner_reminder(video_id, liveChatId, stream_name, reminder_msg)
+        return
+
+    # --- Regular viewer: 1st offense = reminder, 2nd offense = real timeout ---
+    with _moderation_state_lock:
+        stream_offenses = _offense_counts.setdefault(video_id, {})
+        offense_count = stream_offenses.get(userChannelId, 0) + 1
+        stream_offenses[userChannelId] = offense_count
+
+    if offense_count == 1:
+        reminder_msg = reminder_template.format(userName=userName)
+        sendReplyToLiveChat(liveChatId, reminder_msg, stream_name=stream_name)
+        return
+
+    # 2nd (or later) offense — attempt an actual timeout.
+    # is_bot_moderator() returns True/False only if we already know from a
+    # prior send/ban on this liveChatId; None means unknown, in which case
+    # we still attempt the timeout and let its own result tell us — this
+    # avoids the owner-only liveChatModerators().list() endpoint entirely.
+    known_mod_status = is_bot_moderator(liveChatId)
+
+    if known_mod_status is False:
+        _send_mod_request(video_id, liveChatId, stream_name)
+        return
+
+    success, permission_denied = timeoutUser(liveChatId, userChannelId, duration_seconds, stream_name=stream_name)
+
+    if not success and permission_denied:
+        _send_mod_request(video_id, liveChatId, stream_name)
+        return
+
+    if success:
+        timeout_msg = timeout_template.format(
+            userName=userName, duration=format_duration(duration_seconds)
+        )
+        sendReplyToLiveChat(liveChatId, timeout_msg, stream_name=stream_name)
+        # Reset offense count after a successful timeout so it doesn't
+        # immediately re-trigger the moment they're allowed back.
+        with _moderation_state_lock:
+            _offense_counts.setdefault(video_id, {})[userChannelId] = 0
+
+
+def process_command(userName, userChannelId, message_text, liveChatId, last_reply_time, BLOCKED_BOTS, COOLDOWN_SECONDS, stream_name="?", video_id=None, is_moderator=False, is_owner=False, recent_messages=None):
     """Processes commands coming from either pytchat or backup API."""
     clean_name = userName.lower().replace('@', '')
     clean_handle = str(userChannelId).lower().replace('@', '')
@@ -675,7 +1409,13 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
         return last_reply_time
 
     message_text = message_text.strip()
-    add_log(f"New chat message from {userName}: {message_text}")
+    add_log(f"New chat message in '{stream_name}' from {userName}: {message_text}")
+
+    if video_id is not None:
+        run_moderation_check(
+            video_id, stream_name, liveChatId, userName, userChannelId,
+            message_text, is_moderator, is_owner, recent_messages
+        )
 
     lower_msg = message_text.lower()
     is_command = (
@@ -694,11 +1434,11 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
         return last_reply_time
 
     if lower_msg in ["hello", "hi", "hey"]:
-        sendReplyToLiveChat(liveChatId, f"Hey {userName}! Welcome to the stream!")
+        sendReplyToLiveChat(liveChatId, f"Hey {userName}! Welcome to the stream!", stream_name=stream_name)
         return time.time()
 
     elif lower_msg in ["!revertical"]:
-        sendReplyToLiveChat(liveChatId, f"dawg WHO said “revertical” 😭✌️")
+        sendReplyToLiveChat(liveChatId, f"dawg WHO said “revertical” 😭✌️", stream_name=stream_name)
         return time.time()
 
     elif lower_msg in ["!random", "!rand"]:
@@ -725,23 +1465,23 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
             "There's no place like 127.0.0.1"
         ]
         joke = random.choice(jokes)
-        sendReplyToLiveChat(liveChatId, joke)
+        sendReplyToLiveChat(liveChatId, joke, stream_name=stream_name)
         return time.time()
 
     elif lower_msg in ["!commands", "!help"]:
         cmd_url = "https://youtube-livestream-chatbot.onrender.com/commands"
-        sendReplyToLiveChat(liveChatId, f"{userName} -> The bot commands are available at {cmd_url}")
+        sendReplyToLiveChat(liveChatId, f"{userName} -> The bot commands are available at {cmd_url}", stream_name=stream_name)
         return time.time()
 
     elif lower_msg in ["e"]:
-        sendReplyToLiveChat(liveChatId, f"E")
+        sendReplyToLiveChat(liveChatId, f"E", stream_name=stream_name)
         return time.time()
 
     elif lower_msg.startswith(("!chatmbr", "!ai")):
         query = message_text[8:].strip() if lower_msg.startswith("!chatmbr") else message_text[3:].strip()
 
         if not query:
-            sendReplyToLiveChat(liveChatId, f"{userName} Please provide a query! Usage: !chatmbr <question> or !ai <question>")
+            sendReplyToLiveChat(liveChatId, f"{userName} Please provide a query! Usage: !chatmbr <question> or !ai <question>", stream_name=stream_name)
             return time.time()
         else:
             try:
@@ -755,11 +1495,11 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
                 if len(api_reply) > 200:
                     api_reply = api_reply[:197] + "..."
 
-                sendReplyToLiveChat(liveChatId, api_reply)
+                sendReplyToLiveChat(liveChatId, api_reply, stream_name=stream_name)
                 return time.time()
             except Exception as e:
                 add_log(f"Error fetching from ChatMBR API: {e}")
-                sendReplyToLiveChat(liveChatId, f"{userName} Unable to reach ChatMBR right now.")
+                sendReplyToLiveChat(liveChatId, f"{userName} Unable to reach ChatMBR right now.", stream_name=stream_name)
                 return time.time()
 
     elif lower_msg == "!coins":
@@ -767,18 +1507,18 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
         user_key = make_user_key(userName, userChannelId)
         record = get_user_record(coins, user_key, display_name=userName)
         save_coins(coins)  # Persist in case this created a brand-new user record
-        sendReplyToLiveChat(liveChatId, f"{userName} has {record['balance']} NeilCoins.")
+        sendReplyToLiveChat(liveChatId, f"{userName} has {record['balance']} NeilCoins.", stream_name=stream_name)
         return time.time()
 
     elif lower_msg.startswith("!gamble"):
         parts = message_text.split(maxsplit=1)
         if len(parts) < 2 or not parts[1].strip().lstrip('-').isdigit():
-            sendReplyToLiveChat(liveChatId, f"{userName} Usage: !gamble <number> (e.g. !gamble 50)")
+            sendReplyToLiveChat(liveChatId, f"{userName} Usage: !gamble <number> (e.g. !gamble 50)", stream_name=stream_name)
             return time.time()
 
         bet = int(parts[1].strip())
         if bet <= 0:
-            sendReplyToLiveChat(liveChatId, f"{userName} Bet must be a positive number!")
+            sendReplyToLiveChat(liveChatId, f"{userName} Bet must be a positive number!", stream_name=stream_name)
             return time.time()
 
         coins = load_coins()
@@ -786,17 +1526,17 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
         record = get_user_record(coins, user_key, display_name=userName)
 
         if bet > record['balance']:
-            sendReplyToLiveChat(liveChatId, f"{userName} You only have {record['balance']} NeilCoins — can't bet {bet}!")
+            sendReplyToLiveChat(liveChatId, f"{userName} You only have {record['balance']} NeilCoins — can't bet {bet}!", stream_name=stream_name)
             save_coins(coins)
             return time.time()
 
         won = random.choice([True, False])
         if won:
             record['balance'] += bet
-            sendReplyToLiveChat(liveChatId, f"🎉 {userName} gambled {bet} and WON! New balance: {record['balance']} NeilCoins.")
+            sendReplyToLiveChat(liveChatId, f"🎉 {userName} gambled {bet} and WON! New balance: {record['balance']} NeilCoins.", stream_name=stream_name)
         else:
             record['balance'] -= bet
-            sendReplyToLiveChat(liveChatId, f"💀 {userName} gambled {bet} and LOST! New balance: {record['balance']} NeilCoins.")
+            sendReplyToLiveChat(liveChatId, f"💀 {userName} gambled {bet} and LOST! New balance: {record['balance']} NeilCoins.", stream_name=stream_name)
 
         save_coins(coins)
         return time.time()
@@ -804,14 +1544,14 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
     elif lower_msg.startswith("!giftpoint"):
         parts = message_text.split(maxsplit=2)
         if len(parts) < 3 or not parts[2].strip().isdigit():
-            sendReplyToLiveChat(liveChatId, f"{userName} Usage: !giftpoint @Username <points>")
+            sendReplyToLiveChat(liveChatId, f"{userName} Usage: !giftpoint @Username <points>", stream_name=stream_name)
             return time.time()
 
         target_raw = parts[1].strip()
         gift_amount = int(parts[2].strip())
 
         if gift_amount <= 0:
-            sendReplyToLiveChat(liveChatId, f"{userName} Gift amount must be a positive number!")
+            sendReplyToLiveChat(liveChatId, f"{userName} Gift amount must be a positive number!", stream_name=stream_name)
             return time.time()
 
         # Clean `@` from both target and sender for a clean string check
@@ -819,7 +1559,7 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
         clean_sender = userName.lstrip('@').strip().lower()
 
         if clean_target == clean_sender:
-            sendReplyToLiveChat(liveChatId, f"{userName} You can't giftpoint yourself!")
+            sendReplyToLiveChat(liveChatId, f"{userName} You can't giftpoint yourself!", stream_name=stream_name)
             return time.time()
 
         coins = load_coins()
@@ -827,11 +1567,15 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
         sender_record = get_user_record(coins, sender_key, display_name=userName)
 
         if gift_amount > sender_record['balance']:
-            sendReplyToLiveChat(liveChatId, f"{userName} You only have {sender_record['balance']} NeilCoins — can't gift {gift_amount}!")
+            sendReplyToLiveChat(liveChatId, f"{userName} You only have {sender_record['balance']} NeilCoins — can't gift {gift_amount}!", stream_name=stream_name)
             save_coins(coins)
             return time.time()
 
-        # Search existing JSON records by stripping `@` from stored names to ensure a hit
+        # Only gift to users who already have a real account (i.e. they've
+        # chatted at least once, tied to an actual channel ID). This closes
+        # an exploit where !giftpoint could conjure a brand-new coin account
+        # for any typed name — including names nobody could ever claim —
+        # effectively creating coins out of thin air.
         target_key = None
         for key, rec in coins.items():
             stored_name_clean = rec.get('name', '').lstrip('@').strip().lower()
@@ -839,34 +1583,32 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
                 target_key = key
                 break
 
-        # If user isn't found in the database, refuse to create a dummy account and exit!
         if target_key is None:
-            sendReplyToLiveChat(liveChatId, f"{userName} Couldn't find a user named '{target_raw}'. They must use !gamble or !coins first!")
+            sendReplyToLiveChat(liveChatId, f"{userName} Couldn't find a user named '{target_raw}'. They must send !gamble or !coins first!", stream_name=stream_name)
             save_coins(coins)
             return time.time()
 
-        # Credit the found existing account
         target_record = coins[target_key]
 
         sender_record['balance'] -= gift_amount
         target_record['balance'] += gift_amount
         save_coins(coins)
 
-        sendReplyToLiveChat(liveChatId, f"🎁 {userName} gifted {gift_amount} NeilCoins to {target_record['name']}!")
+        sendReplyToLiveChat(liveChatId, f"🎁 {userName} gifted {gift_amount} NeilCoins to {target_record['name']}!", stream_name=stream_name)
         return time.time()
 
     elif lower_msg == "!resetcoins":
         coins = load_coins()
         user_key = make_user_key(userName, userChannelId)
-        record = get_user_record(coins, user_key, display_name=userName)
+        record = get_user_record(coins, user_key)
 
         if record['balance'] != 0:
-            sendReplyToLiveChat(liveChatId, f"{userName} !resetcoins only works when your balance is exactly 0 (you have {record['balance']}).")
+            sendReplyToLiveChat(liveChatId, f"{userName} !resetcoins only works when your balance is exactly 0 (you have {record['balance']}).", stream_name=stream_name)
             save_coins(coins)
             return time.time()
 
         if record.get('resetcoins_uses', 0) >= RESETCOINS_MAX_USES:
-            sendReplyToLiveChat(liveChatId, f"{userName} You've already used !resetcoins {RESETCOINS_MAX_USES} times — no more resets for you!")
+            sendReplyToLiveChat(liveChatId, f"{userName} You've already used !resetcoins {RESETCOINS_MAX_USES} times — no more resets for you!", stream_name=stream_name)
             save_coins(coins)
             return time.time()
 
@@ -875,20 +1617,13 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
         save_coins(coins)
 
         uses_left = RESETCOINS_MAX_USES - record['resetcoins_uses']
-        sendReplyToLiveChat(liveChatId, f"{userName} got +{RESETCOINS_GRANT} NeilCoins! Balance: {record['balance']} ({uses_left} reset(s) left).")
+        sendReplyToLiveChat(liveChatId, f"{userName} got +{RESETCOINS_GRANT} NeilCoins! Balance: {record['balance']} ({uses_left} reset(s) left).", stream_name=stream_name)
         return time.time()
 
     elif lower_msg == "!leaderboard":
-        coins = load_coins()
-        if not coins:
-            sendReplyToLiveChat(liveChatId, "No NeilCoins data yet — be the first to !gamble or check !coins!")
-            return time.time()
-
-        top_5 = sorted(coins.values(), key=lambda r: r.get('balance', 0), reverse=True)[:5]
-        leaderboard_str = " | ".join(
-            f"{i+1}. {r['name']}: {r['balance']}" for i, r in enumerate(top_5)
-        )
-        sendReplyToLiveChat(liveChatId, f"🏆 NeilCoins Leaderboard — {leaderboard_str}")
+        leaderboard_url = "https://youtube-livestream-chatbot.onrender.com/leaderboard"
+        sendReplyToLiveChat(liveChatId, f"{userName} -> The leaderboard is available at {leaderboard_url}", stream_name=stream_name)
+        return time.time()
         return time.time()
 
     return last_reply_time
@@ -906,7 +1641,19 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
     """
     active_youtube_backup = youtube_backup1
 
+    if stop_flag.is_set():
+        add_log(f"'{stream_name}' ({stream_id}) stopped before chat became available.")
+        return
+
+    # Only these two messages (raised by getLiveChatId itself) genuinely mean
+    # "this stream doesn't exist / has no active chat" — safe to stop
+    # immediately on. Any other exception (network blips, malformed API
+    # responses, etc.) is treated as transient and gets one retry before
+    # giving up, so a startup hiccup doesn't falsely kill a real stream.
+    KNOWN_UNAVAILABLE_MARKERS = ("not found.", "No active live chat found")
+
     liveChatId = None
+    attempted_retry = False
     while liveChatId is None:
         if stop_flag.is_set():
             add_log(f"'{stream_name}' ({stream_id}) stopped before chat became available.")
@@ -915,9 +1662,26 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
             liveChatId = getLiveChatId(stream_id)
             add_log(f"Started listening to '{stream_name}' ({stream_id})")
         except Exception as e:
+            error_text = str(e)
+            is_known_unavailable = any(marker in error_text for marker in KNOWN_UNAVAILABLE_MARKERS)
+
             add_log(f"Error connecting to '{stream_name}' ({stream_id}): {e}")
-            add_log(f"Chat not available yet for '{stream_name}'. Will retry in 60 seconds...")
-            for _ in range(60):
+
+            if is_known_unavailable:
+                add_log(f"🔴 '{stream_name}' ({stream_id}) — no active live chat. Stopping listener.")
+                mark_stream_stopped(stream_id)
+                add_log(f"'{stream_name}' ({stream_id}) listener stopped (never went live / already ended). /live now shows it as ⚪ Stopped.")
+                return
+
+            if attempted_retry:
+                add_log(f"🔴 '{stream_name}' ({stream_id}) — unexpected error persisted after retry. Stopping listener.")
+                mark_stream_stopped(stream_id)
+                add_log(f"'{stream_name}' ({stream_id}) listener stopped (connection error). /live now shows it as ⚪ Stopped.")
+                return
+
+            attempted_retry = True
+            add_log(f"Unexpected error for '{stream_name}' — retrying once in 15 seconds...")
+            for _ in range(15):
                 if stop_flag.is_set():
                     return
                 time.sleep(1)
@@ -986,10 +1750,13 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
                     userName = msg_item.author.name
                     userChannelId = getattr(msg_item.author, 'channelId', '')
                     message_text = msg_item.message
+                    is_moderator = getattr(msg_item.author, 'isChatModerator', False)
+                    is_owner = getattr(msg_item.author, 'isChatOwner', False)
 
                     last_reply_time = process_command(
                         userName, userChannelId, message_text, liveChatId,
-                        last_reply_time, BLOCKED_BOTS, COOLDOWN_SECONDS
+                        last_reply_time, BLOCKED_BOTS, COOLDOWN_SECONDS, stream_name=stream_name,
+                        video_id=stream_id, is_moderator=is_moderator, is_owner=is_owner
                     )
                 time.sleep(1)
 
@@ -1019,10 +1786,13 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
                     userName = item['authorDetails']['displayName']
                     userChannelId = item['authorDetails']['channelId']
                     message_text = item['snippet']['displayMessage']
+                    is_moderator = item['authorDetails'].get('isChatModerator', False)
+                    is_owner = item['authorDetails'].get('isChatOwner', False)
 
                     last_reply_time = process_command(
                         userName, userChannelId, message_text, liveChatId,
-                        last_reply_time, BLOCKED_BOTS, COOLDOWN_SECONDS
+                        last_reply_time, BLOCKED_BOTS, COOLDOWN_SECONDS, stream_name=stream_name,
+                        video_id=stream_id, is_moderator=is_moderator, is_owner=is_owner
                     )
 
                 time.sleep(max(polling_millis / 1000.0, 10.0))
@@ -1034,10 +1804,30 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
                     active_youtube_backup = youtube_backup2
                     next_page_token = None
                 else:
-                    add_log(f"Backup 2 quota exceeded for '{stream_name}'. Pausing 15 min...")
-                    time.sleep(900)
-                    active_youtube_backup = youtube_backup1
-                    next_page_token = None
+                    add_log(f"Backup 2 quota exceeded for '{stream_name}'. Pausing 30 seconds before restoring pytchat one last time...")
+                    time.sleep(30)
+
+                    try:
+                        test_chat = safe_pytchat_create(stream_id)
+                        if test_chat.is_alive():
+                            chat = test_chat
+                            use_api_fallback = False
+                            pytchat_failed_attempts = 0
+                            next_page_token = None
+                            add_log(f"Pytchat restored for '{stream_name}'! Resuming without waiting for quota reset.")
+                            consecutive_api_failures = 0
+                            continue
+                        else:
+                            raise Exception("Pytchat stream initialization failed.")
+                    except Exception as pytchat_error:
+                        wait_seconds, utc_offset_label = seconds_until_next_midnight_pt()
+                        add_log(f"Pytchat restore failed for '{stream_name}': {pytchat_error}. Pausing until 00:00 PT ({utc_offset_label} UTC).")
+                        time.sleep(wait_seconds)
+                        active_youtube_backup = youtube_backup1
+                        next_page_token = None
+                        use_api_fallback = False  # Try pytchat first on resume
+                        last_pytchat_retry = time.time()
+                        add_log(f"Quota reset time reached for '{stream_name}'. Retrying pytchat first...")
                 consecutive_api_failures = 0  # Quota errors don't mean the stream ended
             elif e.resp.status == 404:
                 # 404 = live chat no longer exists → stream ended
@@ -1059,7 +1849,16 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
             add_log(f"Error in '{stream_name}' chat loop: {e}")
             time.sleep(5)
 
-    add_log(f"'{stream_name}' ({stream_id}) listener stopped (removed via /live dashboard).")
+    if stop_flag.is_set():
+        # Loop exited because /live's Remove button was clicked —
+        # stop_stream_listener() already cleaned up active_stream_ids.
+        add_log(f"'{stream_name}' ({stream_id}) listener stopped (removed via /live dashboard).")
+    else:
+        # Loop exited on its own (break — stream ended / too many API
+        # errors). Nothing has cleaned up active_stream_ids yet, so /live
+        # would otherwise keep showing this as 🟢 Listening forever.
+        mark_stream_stopped(stream_id)
+        add_log(f"'{stream_name}' ({stream_id}) listener stopped (stream ended). /live now shows it as ⚪ Stopped.")
 
 
 def main():
