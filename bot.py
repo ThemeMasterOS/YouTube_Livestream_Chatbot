@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import signal
 import time
 import random
@@ -305,10 +306,21 @@ def check_blocklist_categories(config, lower_msg):
     dict, or None if no category matches. Categories are checked in
     insertion order; the first match wins if a message happens to match
     words from more than one category.
+
+    Matches on whole-word boundaries (\\b) rather than a plain substring
+    check — a plain "bad_word in lower_msg" test would false-positive on
+    innocent words that merely CONTAIN a blocked word, e.g. "ass" matching
+    inside "passeando" or "class". \\b treats each blocked entry as its own
+    word (or exact phrase, for multi-word entries), bounded by whitespace,
+    punctuation, or the start/end of the message.
     """
     for category in config.get("blocklist_categories", {}).values():
         for bad_word in category.get("words", []):
-            if bad_word and bad_word.lower() in lower_msg:
+            bad_word = bad_word.strip().lower()
+            if not bad_word:
+                continue
+            pattern = r'\b' + re.escape(bad_word) + r'\b'
+            if re.search(pattern, lower_msg):
                 return category
     return None
 
