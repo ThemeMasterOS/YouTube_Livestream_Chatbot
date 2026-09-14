@@ -1859,7 +1859,25 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
                 time.sleep(10)
         except Exception as e:
             add_log(f"Error in '{stream_name}' chat loop: {e}")
-            time.sleep(5)
+            time.sleep(3)  # Small pause first, in case it's a transient blip
+
+            try:
+                test_chat = safe_pytchat_create(stream_id)
+                if test_chat.is_alive():
+                    chat = test_chat
+                    use_api_fallback = False
+                    pytchat_failed_attempts = 0
+                    next_page_token = None
+                    add_log(f"Pytchat restored for '{stream_name}' after chat loop error!")
+                    continue
+                else:
+                    raise Exception("Pytchat stream initialization failed.")
+            except Exception as restore_error:
+                add_log(f"Pytchat restore failed after chat loop error for '{stream_name}': {restore_error}. Switching to API Fallback...")
+                use_api_fallback = True
+                pytchat_failed_attempts = 0
+                next_page_token = None
+                last_pytchat_retry = time.time()
 
     if stop_flag.is_set():
         # Loop exited because /live's Remove button was clicked —
