@@ -1816,8 +1816,8 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
                     active_youtube_backup = youtube_backup2
                     next_page_token = None
                 else:
-                    add_log(f"Backup 2 quota exceeded for '{stream_name}'. Pausing 30 seconds before restoring pytchat one last time...")
-                    time.sleep(30)
+                    add_log(f"Backup 2 quota exceeded for '{stream_name}'. Pausing 15 seconds before restoring pytchat one last time...")
+                    time.sleep(15)
 
                     try:
                         test_chat = safe_pytchat_create(stream_id)
