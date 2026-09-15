@@ -1772,6 +1772,14 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
                             next_page_token = None
                             last_pytchat_retry = time.time()
                             continue  # Route to the API-fallback branch next pass, not the dead pytchat object below
+                    else:
+                        # Attempts 1 and 2 haven't hit the restore threshold
+                        # yet — skip straight to re-checking is_alive() next
+                        # pass instead of falling through to sync_items()
+                        # below, which would call it on a connection just
+                        # confirmed dead and throw an avoidable exception.
+                        time.sleep(2)
+                        continue
                 else:
                     # Connection is confirmed healthy this pass — safe to
                     # reset the streak. Resetting unconditionally here
