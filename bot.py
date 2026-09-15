@@ -1660,12 +1660,14 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
     # Only these two messages (raised by getLiveChatId itself) genuinely mean
     # "this stream doesn't exist / has no active chat" — safe to stop
     # immediately on. Any other exception (network blips, malformed API
-    # responses, etc.) is treated as transient and gets one retry before
-    # giving up, so a startup hiccup doesn't falsely kill a real stream.
+    # responses, etc.) is treated as transient and gets up to 2 retries
+    # (3 attempts total) with growing delays before giving up, so a
+    # startup hiccup doesn't falsely kill a real stream.
     KNOWN_UNAVAILABLE_MARKERS = ("not found.", "No active live chat found")
+    RETRY_DELAYS_SECONDS = [15, 30]  # Delay before attempt 2, then before attempt 3
 
     liveChatId = None
-    attempted_retry = False
+    attempt_number = 1
     while liveChatId is None:
         if stop_flag.is_set():
             add_log(f"'{stream_name}' ({stream_id}) stopped before chat became available.")
@@ -1685,15 +1687,16 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
                 add_log(f"'{stream_name}' ({stream_id}) listener stopped (never went live / already ended). /live now shows it as ⚪ Stopped.")
                 return
 
-            if attempted_retry:
-                add_log(f"🔴 '{stream_name}' ({stream_id}) — unexpected error persisted after retry. Stopping listener.")
+            if attempt_number > len(RETRY_DELAYS_SECONDS):
+                add_log(f"🔴 '{stream_name}' ({stream_id}) — unexpected error persisted after {attempt_number} attempts. Stopping listener.")
                 mark_stream_stopped(stream_id)
                 add_log(f"'{stream_name}' ({stream_id}) listener stopped (connection error). /live now shows it as ⚪ Stopped.")
                 return
 
-            attempted_retry = True
-            add_log(f"Unexpected error for '{stream_name}' — retrying once in 15 seconds...")
-            for _ in range(15):
+            delay = RETRY_DELAYS_SECONDS[attempt_number - 1]
+            attempt_number += 1
+            add_log(f"Unexpected error for '{stream_name}' — retrying (attempt {attempt_number}/{len(RETRY_DELAYS_SECONDS) + 1}) in {delay} seconds...")
+            for _ in range(delay):
                 if stop_flag.is_set():
                     return
                 time.sleep(1)
@@ -1748,28 +1751,34 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
                 if not chat or not chat.is_alive():
                     pytchat_failed_attempts += 1
                     add_log(f"Pytchat connection check failed for '{stream_name}' ({pytchat_failed_attempts}/3)...")
-                    
+
                     if pytchat_failed_attempts >= 3:
                         add_log(f"Pytchat failed 3 consecutive times. Attempting to restore pytchat for '{stream_name}'...")
                         time.sleep(3)
 
-                    try:
-                        test_chat = safe_pytchat_create(stream_id)
-                        if test_chat.is_alive():
-                            chat = test_chat
-                            use_api_fallback = False
+                        try:
+                            test_chat = safe_pytchat_create(stream_id)
+                            if test_chat.is_alive():
+                                chat = test_chat
+                                use_api_fallback = False
+                                pytchat_failed_attempts = 0
+                                next_page_token = None
+                                add_log(f"Pytchat restored for '{stream_name}'!")
+                                continue
+                        except Exception as theme_master:
+                            add_log(f"Pytchat restore failed for '{stream_name}': {theme_master} Switching to API fallback...")
+                            use_api_fallback = True
                             pytchat_failed_attempts = 0
                             next_page_token = None
-                            add_log(f"Pytchat restored for '{stream_name}'!")
-                            continue
-                    except Exception as theme_master:
-                        add_log(f"Pytchat restore failed for '{stream_name}': {theme_master} Switching to API fallback...")
-                        use_api_fallback = True
-                        pytchat_failed_attempts = 0
-                        next_page_token = None
-                        last_pytchat_retry = time.time()
-
-                pytchat_failed_attempts = 0
+                            last_pytchat_retry = time.time()
+                            continue  # Route to the API-fallback branch next pass, not the dead pytchat object below
+                else:
+                    # Connection is confirmed healthy this pass — safe to
+                    # reset the streak. Resetting unconditionally here
+                    # (rather than after every pass regardless of health)
+                    # is what lets failures actually accumulate toward 3
+                    # instead of being wiped out before the threshold.
+                    pytchat_failed_attempts = 0
 
                 for msg_item in chat.get().sync_items():
                     userName = msg_item.author.name
