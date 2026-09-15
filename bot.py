@@ -1747,16 +1747,27 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
             if not use_api_fallback:
                 if not chat or not chat.is_alive():
                     pytchat_failed_attempts += 1
-                    add_log(f"Pytchat connection check failed ({pytchat_failed_attempts}/3)...")
+                    add_log(f"Pytchat connection check failed for '{stream_name}' ({pytchat_failed_attempts}/3)...")
                     
                     if pytchat_failed_attempts >= 3:
-                        add_log(f"Pytchat failed 3 consecutive times. Switching '{stream_name}' to API Fallback...")
+                        add_log(f"Pytchat failed 3 consecutive times. Attempting to restore pytchat for '{stream_name}'...")
+                        time.sleep(3)
+
+                    try:
+                        test_chat = safe_pytchat_create(stream_id)
+                        if test_chat.is_alive():
+                            chat = test_chat
+                            use_api_fallback = False
+                            pytchat_failed_attempts = 0
+                            next_page_token = None
+                            add_log(f"Pytchat restored for '{stream_name}'!")
+                            continue
+                    except Exception as theme_master:
+                        add_log(f"Pytchat restore failed for '{stream_name}': {theme_master} Switching to API fallback...")
                         use_api_fallback = True
                         pytchat_failed_attempts = 0
                         next_page_token = None
                         last_pytchat_retry = time.time()
-                    time.sleep(2)
-                    continue
 
                 pytchat_failed_attempts = 0
 
