@@ -59,7 +59,7 @@ STREAMS_FILE = "streams_config.json"
 COINS_FILE = "coins_config.json"
 DEFAULT_STARTING_COINS = 100
 RESETCOINS_GRANT = 25
-RESETCOINS_MAX_USES = 3
+RESETCOINS_MAX_USES = 5
 
 # --- Moderation Storage ---
 MODERATION_FILE = "moderation_config.json"
@@ -1710,7 +1710,7 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
     chat = None
 
     last_pytchat_retry = 0
-    PYTCHAT_RETRY_INTERVAL = 180
+    PYTCHAT_RETRY_INTERVAL = 600
     pytchat_failed_attempts = 0
     
     # Stream-end detection: count consecutive API failures
