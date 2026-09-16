@@ -478,7 +478,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                     <tr><td><code>!coins</code></td><td>Shows your current NeilCoins balance.</td></tr>
                     <tr><td><code>!gamble &lt;number&gt;</code></td><td>Bets that many NeilCoins — 50/50 chance to double it or lose it.</td></tr>
                     <tr><td><code>!giftpoint @Username &lt;points&gt;</code></td><td>Gifts NeilCoins to another user (can't gift yourself).</td></tr>
-                    <tr><td><code>!resetcoins</code></td><td>Grants +25 NeilCoins, but only if your balance is exactly 0. Max 3 uses ever.</td></tr>
+                    <tr><td><code>!resetcoins</code></td><td>Grants +25 NeilCoins, but only if your balance is exactly 0. Max 5 uses ever.</td></tr>
                     <tr><td><code>!leaderboard</code></td><td>Links to the <code>/leaderboard</code> page (top 50 users by NeilCoins).</td></tr>
                 </table>
             </body>
