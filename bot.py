@@ -1274,13 +1274,27 @@ def format_duration(seconds):
 #     message sent on this stream (per-stream cooldown, not once-ever).
 # _last_mod_owner_reminder_time[video_id] -> timestamp of the last reminder
 #     sent to a moderator/owner on this stream (per-stream cooldown).
+# _recently_timed_out[video_id][userChannelId] -> timestamp of the last
+#     successful timeout for this user on this stream. Messages that were
+#     already queued up in the same sync_items()/API poll batch as the one
+#     that triggered a timeout still get handed to run_moderation_check()
+#     afterward — YouTube's ban hasn't silenced them yet from the bot's
+#     point of view, just from the perspective of NEW messages arriving.
+#     This buffer makes the bot itself skip anything from that user for a
+#     short window right after a timeout, so a burst of messages sent all
+#     at once can't cycle through reminder->timeout->reset several times
+#     in a single batch and fire multiple real liveChatBans() calls for
+#     what was really only ever one spam burst.
 _recent_messages = {}
 _offense_counts = {}
 _last_mod_request_time = {}
 _last_mod_owner_reminder_time = {}
+_recently_timed_out = {}
 _moderation_state_lock = threading.Lock()
 
 MOD_MESSAGE_COOLDOWN_SECONDS = 10
+POST_TIMEOUT_SKIP_SECONDS = 20  # Short buffer, not the real ban duration —
+                                 # see _recently_timed_out note above for why.
 
 
 def _send_mod_request(video_id, liveChatId, stream_name):
@@ -1328,6 +1342,20 @@ def run_moderation_check(video_id, stream_name, liveChatId, userName, userChanne
     duration and message templates apply. Called on every chat message,
     not just bot commands.
     """
+    # A batch of sync_items()/API-poll results can contain several messages
+    # a user sent within the same second or two — all handed to this
+    # function one after another, with no gap for YouTube's actual ban to
+    # have taken effect yet. Without this check, that whole backlog could
+    # cycle through reminder -> timeout -> reset multiple times per batch,
+    # firing several real liveChatBans() calls for one spam burst. Skip
+    # anyone timed out in roughly the last POST_TIMEOUT_SKIP_SECONDS —
+    # YouTube's own ban already silences them for the real duration; this
+    # buffer only needs to cover the batch-processing gap, not the full ban.
+    with _moderation_state_lock:
+        last_timeout_at = _recently_timed_out.get(video_id, {}).get(userChannelId)
+    if last_timeout_at is not None and (time.time() - last_timeout_at) < POST_TIMEOUT_SKIP_SECONDS:
+        return
+
     config = load_moderation()
     lower_msg = message_text.strip().lower()
 
@@ -1406,9 +1434,13 @@ def run_moderation_check(video_id, stream_name, liveChatId, userName, userChanne
         )
         sendReplyToLiveChat(liveChatId, timeout_msg, stream_name=stream_name)
         # Reset offense count after a successful timeout so it doesn't
-        # immediately re-trigger the moment they're allowed back.
+        # immediately re-trigger the moment they're allowed back, and
+        # record when this happened so any remaining messages from this
+        # user still left in the current batch get skipped instead of
+        # re-triggering another full reminder->timeout cycle.
         with _moderation_state_lock:
             _offense_counts.setdefault(video_id, {})[userChannelId] = 0
+            _recently_timed_out.setdefault(video_id, {})[userChannelId] = time.time()
 
 
 def process_command(userName, userChannelId, message_text, liveChatId, last_reply_time, BLOCKED_BOTS, COOLDOWN_SECONDS, stream_name="?", video_id=None, is_moderator=False, is_owner=False, recent_messages=None):
