@@ -1569,6 +1569,14 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
         user_key = make_user_key(userName, userChannelId)
         record = get_user_record(coins, user_key, display_name=userName)
 
+        if record['balance'] == 0:
+            if record.get('resetcoins_uses', 0) < RESETCOINS_MAX_USES:
+                sendReplyToLiveChat(liveChatId, f"{userName}, you have 0 NeilCoins — use !resetcoins to get some back.", stream_name=stream_name)
+            else:
+                sendReplyToLiveChat(liveChatId, f"{userName}, you have 0 NeilCoins and no !resetcoins left — wait for someone to giftpoint you.", stream_name=stream_name)
+            save_coins(coins)
+            return time.time()
+
         if bet > record['balance']:
             sendReplyToLiveChat(liveChatId, f"{userName} You only have {record['balance']} NeilCoins — can't bet {bet}!", stream_name=stream_name)
             save_coins(coins)
@@ -1609,6 +1617,14 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
         coins = load_coins()
         sender_key = make_user_key(userName, userChannelId)
         sender_record = get_user_record(coins, sender_key, display_name=userName)
+
+        if sender_record['balance'] == 0:
+            if sender_record.get('resetcoins_uses', 0) < RESETCOINS_MAX_USES:
+                sendReplyToLiveChat(liveChatId, f"{userName}, you have 0 NeilCoins — use !resetcoins to get some back.", stream_name=stream_name)
+            else:
+                sendReplyToLiveChat(liveChatId, f"{userName}, you have 0 NeilCoins and no !resetcoins left — wait for someone to giftpoint you.", stream_name=stream_name)
+            save_coins(coins)
+            return time.time()
 
         if gift_amount > sender_record['balance']:
             sendReplyToLiveChat(liveChatId, f"{userName} You only have {sender_record['balance']} NeilCoins — can't gift {gift_amount}!", stream_name=stream_name)
@@ -1743,7 +1759,6 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
 
     last_pytchat_retry = 0
     PYTCHAT_RETRY_INTERVAL = 600
-    pytchat_failed_attempts = 0
     
     # Stream-end detection: count consecutive API failures
     # If we get 3+ in a row, the stream has likely ended
@@ -1772,7 +1787,6 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
                     if test_chat.is_alive():
                         chat = test_chat
                         use_api_fallback = False
-                        pytchat_failed_attempts = 0
                         next_page_token = None
                         add_log(f"Pytchat restored for '{stream_name}'!")
                         continue
@@ -1781,44 +1795,23 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
 
             if not use_api_fallback:
                 if not chat or not chat.is_alive():
-                    pytchat_failed_attempts += 1
-                    add_log(f"Pytchat connection check failed for '{stream_name}' ({pytchat_failed_attempts}/3)...")
+                    add_log(f"Attempting to restore pytchat for '{stream_name}'...")
+                    time.sleep(3)
 
-                    if pytchat_failed_attempts >= 3:
-                        add_log(f"Pytchat failed 3 consecutive times. Attempting to restore pytchat for '{stream_name}'...")
-                        time.sleep(3)
-
-                        try:
-                            test_chat = safe_pytchat_create(stream_id)
-                            if test_chat.is_alive():
-                                chat = test_chat
-                                use_api_fallback = False
-                                pytchat_failed_attempts = 0
-                                next_page_token = None
-                                add_log(f"Pytchat restored for '{stream_name}'!")
-                                continue
-                        except Exception as theme_master:
-                            add_log(f"Pytchat restore failed for '{stream_name}': {theme_master} Switching to API fallback...")
-                            use_api_fallback = True
-                            pytchat_failed_attempts = 0
+                    try:
+                        test_chat = safe_pytchat_create(stream_id)
+                        if test_chat.is_alive():
+                            chat = test_chat
+                            use_api_fallback = False
                             next_page_token = None
-                            last_pytchat_retry = time.time()
-                            continue  # Route to the API-fallback branch next pass, not the dead pytchat object below
-                    else:
-                        # Attempts 1 and 2 haven't hit the restore threshold
-                        # yet — skip straight to re-checking is_alive() next
-                        # pass instead of falling through to sync_items()
-                        # below, which would call it on a connection just
-                        # confirmed dead and throw an avoidable exception.
-                        time.sleep(2)
-                        continue
-                else:
-                    # Connection is confirmed healthy this pass — safe to
-                    # reset the streak. Resetting unconditionally here
-                    # (rather than after every pass regardless of health)
-                    # is what lets failures actually accumulate toward 3
-                    # instead of being wiped out before the threshold.
-                    pytchat_failed_attempts = 0
+                            add_log(f"Pytchat restored for '{stream_name}'!")
+                            continue
+                    except Exception as theme_master:
+                        add_log(f"Pytchat restore failed for '{stream_name}': {theme_master} Switching to API fallback...")
+                        use_api_fallback = True
+                        next_page_token = None
+                        last_pytchat_retry = time.time()
+                        continue  # Route to the API-fallback branch next pass, not the dead pytchat object below
 
                 for msg_item in chat.get().sync_items():
                     userName = msg_item.author.name
@@ -1886,7 +1879,6 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
                         if test_chat.is_alive():
                             chat = test_chat
                             use_api_fallback = False
-                            pytchat_failed_attempts = 0
                             next_page_token = None
                             add_log(f"Pytchat restored for '{stream_name}'! Resuming without waiting for quota reset.")
                             consecutive_api_failures = 0
@@ -1928,7 +1920,6 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
                 if test_chat.is_alive():
                     chat = test_chat
                     use_api_fallback = False
-                    pytchat_failed_attempts = 0
                     next_page_token = None
                     add_log(f"Pytchat restored for '{stream_name}' after chat loop error!")
                     continue
@@ -1937,7 +1928,6 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
             except Exception as restore_error:
                 add_log(f"Pytchat restore failed after chat loop error for '{stream_name}': {restore_error}. Switching to API Fallback...")
                 use_api_fallback = True
-                pytchat_failed_attempts = 0
                 next_page_token = None
                 last_pytchat_retry = time.time()
 
