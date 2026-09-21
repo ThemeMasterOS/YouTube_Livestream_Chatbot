@@ -1,5 +1,6 @@
 import os
 import json
+import math
 import re
 import signal
 import time
@@ -1473,7 +1474,11 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
 
     current_time = time.time()
     if current_time - last_reply_time < COOLDOWN_SECONDS:
-        time_left = int(COOLDOWN_SECONDS - (current_time - last_reply_time))
+        # Round UP (ceiling), not truncate — truncating a value like 0.87s
+        # down to 0 makes the log claim "0s remaining" while the cooldown
+        # is, in fact, still active. Ceiling guarantees the displayed
+        # number is only ever 0 once there's truly nothing left to wait.
+        time_left = math.ceil(COOLDOWN_SECONDS - (current_time - last_reply_time))
         add_log(f"Skipped reply to {userName}: Cooldown active ({time_left}s remaining)")
         return last_reply_time
 
@@ -1749,7 +1754,7 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
                     return
                 time.sleep(1)
 
-    BLOCKED_BOTS = {"nightbot", "streamelements", "moobot", "streamlabs", "thememasterbot", "nabatchatbot"}
+    BLOCKED_BOTS = {"nightbot", "streamelements", "moobot", "streamlabs", "thememasterbot", "nabatchatbot", "windows243remastered"}
     COOLDOWN_SECONDS = 10
     last_reply_time = 0
 
@@ -1795,16 +1800,12 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
 
             if not use_api_fallback:
                 if not chat or not chat.is_alive():
-                    add_log(f"Attempting to restore pytchat for '{stream_name}'...")
-                    time.sleep(3)
-
                     try:
                         test_chat = safe_pytchat_create(stream_id)
                         if test_chat.is_alive():
                             chat = test_chat
                             use_api_fallback = False
                             next_page_token = None
-                            add_log(f"Pytchat restored for '{stream_name}'!")
                             continue
                     except Exception as theme_master:
                         add_log(f"Pytchat restore failed for '{stream_name}': {theme_master} Switching to API fallback...")
