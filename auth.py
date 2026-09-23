@@ -1,44 +1,36 @@
 import os
-from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
 
-TOKEN_FILE = "token.json"
-SCOPES = ["https://www.googleapis.com/auth/youtube.force-ssl"]
+def Authorize(client_secret_file='client_secret.json', token_file='token.json'):
+    creds = None
 
+    # 1. Load token file if present
+    if os.path.exists(token_file):
+        try:
+            creds = Credentials.from_authorized_user_file(token_file)
+        except Exception as e:
+            print(f"Error loading {token_file}: {e}")
 
-def load_token_from_env():
-  """Generates token.json on-the-fly from the YOUTUBE_TOKEN_JSON environment variable."""
-  token_json = os.getenv("YOUTUBE_TOKEN_JSON")
-  if token_json and not os.path.exists(TOKEN_FILE):
-    with open(TOKEN_FILE, "w") as f:
-      f.write(token_json)
+    # 2. Auto-refresh using refresh_token if expired
+    if creds and creds.expired and creds.refresh_token:
+        try:
+            print(f"Access token in {token_file} expired. Automatically refreshing via refresh_token...")
+            creds.refresh(Request())
+            
+            # --- CRITICAL ADDITION: Save updated token to disk ---
+            with open(token_file, "w") as token:
+                token.write(creds.to_json())
+            
+            print(f"Token in {token_file} refreshed and saved successfully!")
+        except Exception as e:
+            print(f"Failed to refresh token for {token_file}: {e}")
+            creds = None
 
+    # 3. Return valid credentials
+    if creds and creds.valid:
+        print(f"Successfully restored session from {token_file}!")
+        return creds
 
-def Authorize(*args, **kwargs):
-  """Loads credentials and automatically refreshes expired access tokens.
-
-  *args and **kwargs allow it to accept any arguments bot.py passes into it.
-  """
-  load_token_from_env()
-
-  creds = None
-
-  if os.path.exists(TOKEN_FILE):
-    try:
-      creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
-    except Exception as e:
-      print(f"Error loading credentials: {e}")
-
-  if creds and creds.expired and creds.refresh_token:
-    try:
-      print("Access token expired. Attempting automatic refresh...")
-      creds.refresh(Request())
-      print("Token refreshed successfully!")
-
-      with open(TOKEN_FILE, "w") as token_file:
-        token_file.write(creds.to_json())
-
-    except Exception as e:
-      print(f"Failed to refresh access token: {e}")
-
-  return creds
+    # 4. Raise error if token is missing/corrupt
+    raise Exception(f"{token_file} is missing or invalid. Check Secret Files on Render.")
