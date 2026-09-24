@@ -1123,15 +1123,15 @@ threading.Thread(target=start_health_check_server, daemon=True).start()
 # -----------------------------------------------
 
 # 1. Main Project YouTube Client (Used for sending replies)
-credentials_main = Authorize('client_secret.json', 'token.json')
+credentials_main = Authorize('client_secret.json', 'token.json', token_env='TOKEN')
 youtube_main = build('youtube', 'v3', credentials=credentials_main)
 
 # 2. Backup 1 Project YouTube Client (First fallback reader)
-credentials_backup1 = Authorize('backup_client_secret.json', 'backup_token.json')
+credentials_backup1 = Authorize('backup_client_secret.json', 'backup_token.json', token_env='TOKEN_BACKUP')
 youtube_backup1 = build('youtube', 'v3', credentials=credentials_backup1)
 
 # 3. Backup 2 Project YouTube Client (Second fallback reader)
-credentials_backup2 = Authorize('backup2_client_secret.json', 'backup2_token.json')
+credentials_backup2 = Authorize('backup2_client_secret.json', 'backup2_token.json', token_env='TOKEN_BACKUP2')
 youtube_backup2 = build('youtube', 'v3', credentials=credentials_backup2)
 
 
