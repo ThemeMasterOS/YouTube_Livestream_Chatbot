@@ -498,14 +498,18 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
 
             stream_rows = ""
             for video_id, data in streams.items():
-                label = data.get('label', '') or 'N/A'
+                raw_label = data.get('label', '') or ''
+                label = raw_label or 'N/A'
                 status = "🟢 Listening" if video_id in running_ids else "⚪ Stopped"
+                label_btn_text = "✏️ Edit/Remove Label" if raw_label else "➕ Add Label"
+                escaped_label = raw_label.replace("\\", "\\\\").replace("'", "\\'")
                 stream_rows += f"""
                 <tr>
                     <td><code>{video_id}</code></td>
                     <td>{label}</td>
                     <td>{status}</td>
                     <td>
+                        <button onclick="editLabel('{video_id}', '{escaped_label}')">{label_btn_text}</button>
                         <button onclick="removeStream('{video_id}')">Remove</button>
                     </td>
                 </tr>
@@ -591,6 +595,20 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                             body: JSON.stringify({{video_id: videoId, label: label}})
                         }}).then(r => r.json()).then(data => {{
                             alert(data.message);
+                            location.reload();
+                        }}).catch(e => alert('Error: ' + e));
+                    }}
+
+                    function editLabel(videoId, currentLabel) {{
+                        const result = prompt('Label for this stream (leave blank to remove):', currentLabel);
+                        if (result === null) return;  // Cancelled
+
+                        const newLabel = result.trim();
+                        fetch('/api/streams', {{
+                            method: 'POST',
+                            headers: {{'Content-Type': 'application/json'}},
+                            body: JSON.stringify({{video_id: videoId, label: newLabel}})
+                        }}).then(r => r.json()).then(data => {{
                             location.reload();
                         }}).catch(e => alert('Error: ' + e));
                     }}
@@ -1518,8 +1536,7 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
         return time.time()
 
     elif lower_msg in ["!commands", "!help"]:
-        cmd_url = "https://youtube-livestream-chatbot.onrender.com/commands"
-        sendReplyToLiveChat(liveChatId, f"{userName} -> The bot commands are available at {cmd_url}", stream_name=stream_name)
+        sendReplyToLiveChat(liveChatId, f"{userName} -> Unfortunately, the bot is currently using my laptop, so I can't send the link for now", stream_name=stream_name)
         return time.time()
 
     elif lower_msg in ["e"]:
@@ -1686,8 +1703,7 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
         return time.time()
 
     elif lower_msg == "!leaderboard":
-        leaderboard_url = "https://youtube-livestream-chatbot.onrender.com/leaderboard"
-        sendReplyToLiveChat(liveChatId, f"{userName} -> The leaderboard is available at {leaderboard_url}", stream_name=stream_name)
+        sendReplyToLiveChat(liveChatId, f"{userName} -> Unfortunately, the bot is currently using my laptop, so I can't send the link for now", stream_name=stream_name)
         return time.time()
         return time.time()
 
