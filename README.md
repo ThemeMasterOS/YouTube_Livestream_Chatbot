@@ -80,3 +80,15 @@ If any backup's files are missing, the bot detects this automatically at startup
 | `pytchat_oembed_patch.py` | Patch required for pytchat to keep working |
 | `requirements.txt` | Python dependencies |
 | `How_To_Make_Your_Own_Bot.txt` | Full beginner setup guide |
+
+---
+
+## License
+
+This project is licensed under the [MIT License](LICENSE) — free to use, modify, and distribute.
+
+---
+
+## Questions / Issues?
+
+Message **@ThemeMasterEXE** on YouTube for help setting this up.
