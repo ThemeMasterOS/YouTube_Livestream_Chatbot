@@ -1989,7 +1989,7 @@ def main():
 
     if not streams:
         add_log("⚠️  No streams configured yet.")
-        add_log("👉 Go to: https://youtube-livestream-chatbot.onrender.com/live")
+        add_log("👉 Go to: localhost:10000/live")
         add_log("📝 Add a video ID there to start listening!")
     else:
         add_log(f"✅ Found {len(streams)} saved stream(s). Starting listeners...")
