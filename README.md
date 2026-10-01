@@ -80,10 +80,3 @@ If any backup's files are missing, the bot detects this automatically at startup
 | `pytchat_oembed_patch.py` | Patch required for pytchat to keep working |
 | `requirements.txt` | Python dependencies |
 | `How_To_Make_Your_Own_Bot.txt` | Full beginner setup guide |
-
----
-
-## Credits
-
-- Built & maintained by [Theme Master](https://github.com/ThemeMasterOS)
-- Forked from [gulraiznoorbari/YouTube_Livestream_Chatbot](https://github.com/gulraiznoorbari/YouTube_Livestream_Chatbot)
