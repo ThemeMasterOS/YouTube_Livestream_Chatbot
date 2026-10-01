@@ -16,9 +16,21 @@ def _load_creds_from_env(token_env):
         return None
 
 
-def Authorize(client_secret_file='client_secret.json', token_file='token.json', token_env=None):
+def Authorize(client_secret_file='client_secret.json', token_file='token.json', token_env=None, optional=False):
+    """
+    optional=False (default): used for the main token. Raises if credentials
+    can't be found/refreshed anywhere, since the bot can't run without it.
+
+    optional=True: used for backup tokens. If the token file, env var, and
+    client secret are all missing, this quietly returns None instead of
+    raising, so the bot can still run with backups disabled.
+    """
     creds = None
     loaded_from_env = False
+
+    if optional and not os.path.exists(token_file) and not os.path.exists(client_secret_file) and not os.getenv(token_env or ""):
+        print(f"{token_file} not found and no env var set — skipping (optional backup).")
+        return None
 
     # 1. Load token file if present
     if os.path.exists(token_file):
@@ -58,6 +70,9 @@ def Authorize(client_secret_file='client_secret.json', token_file='token.json', 
         print(f"Successfully restored session from {source}!")
         return creds
 
-    # 4. Raise error if everything failed
+    # 4. Raise error if everything failed (unless this credential is optional)
     hint = f" or env var {token_env}" if token_env else ""
-    raise Exception(f"{token_file}{hint} is missing or invalid. Check Secret Files / Environment on Render.")
+    if optional:
+        print(f"{token_file}{hint} is missing or invalid. Skipping (optional backup).")
+        return None
+    raise Exception(f"{token_file}{hint} is missing or invalid. Check your Files")
