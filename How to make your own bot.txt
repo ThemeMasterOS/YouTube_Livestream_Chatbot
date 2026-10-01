@@ -1,0 +1,161 @@
+========================================================
+ HOW TO MAKE YOUR OWN YOUTUBE LIVE CHAT BOT
+ (Based on Theme Master Bot — open source, free to use/fork)
+========================================================
+
+Hey! Thanks for asking about the bot. Here's a step-by-step guide
+to get your own copy running on your own computer.
+
+This bot is written in Python and uses the YouTube Data API to read
+and reply to your live chat.
+
+
+--------------------------------------------------------
+STEP 1: DOWNLOAD THE BOT FILES
+--------------------------------------------------------
+
+1. Go to this link:
+   https://github.com/ThemeMasterOS/YouTube_Livestream_Chatbot
+
+2. Click the green "Code" button (top right of the file list).
+
+3. Click "Download ZIP".
+
+4. Once downloaded, right-click the ZIP file and choose
+   "Extract All..." to a folder you'll remember, e.g.:
+   C:\Users\YourName\Documents\bot
+
+You should now have a folder containing:
+   - bot.py
+   - auth.py
+   - pytchat_oembed_patch.py
+   - requirements.txt
+   - README.md
+
+
+--------------------------------------------------------
+STEP 2: INSTALL PYTHON (skip if you already have it)
+--------------------------------------------------------
+
+To check if Python is already installed:
+   1. Open Command Prompt (search "cmd" in the Windows search bar).
+   2. Type: python --version
+   3. Press Enter.
+
+If you see a version number (like "Python 3.14.7"), you're good —
+skip to Step 3.
+
+If you see an error like "python is not recognized":
+   1. Go to https://www.python.org/downloads/
+   2. Click the big "Download Python" button (gets the latest version).
+   3. Run the installer.
+   4. IMPORTANT: On the first install screen, check the box that says
+      "Add Python to PATH" at the bottom BEFORE clicking Install.
+   5. Finish the installation.
+   6. Close and reopen Command Prompt, then type "python --version"
+      again to confirm it worked.
+
+
+--------------------------------------------------------
+STEP 3: INSTALL THE REQUIRED PACKAGES
+--------------------------------------------------------
+
+1. Open Command Prompt.
+
+2. Navigate to the folder where you extracted the bot files.
+   Example:
+      cd C:\Users\YourName\Documents\bot
+
+3. Run this command to install everything the bot needs:
+      pip install -r requirements.txt
+
+   This installs:
+      - google-api-python-client   (talks to YouTube's API)
+      - google-auth-oauthlib       (handles Google sign-in)
+      - google-auth-httplib2
+      - python-dotenv
+      - pytchat                    (reads live chat messages)
+      - httpx
+
+   Wait for it to finish — it may take a minute or two.
+
+
+--------------------------------------------------------
+STEP 4: GET YOUR OWN YOUTUBE API CREDENTIALS
+--------------------------------------------------------
+
+The bot needs its own Google API credentials to connect to YOUR
+YouTube channel. You cannot use someone else's credentials — each
+person needs to create their own for free.
+
+1. Go to https://console.cloud.google.com/
+
+2. Sign in with the Google account tied to your YouTube channel.
+
+3. Create a new Project (top left dropdown → "New Project").
+   Give it any name, e.g. "MyStreamBot".
+
+4. Once the project is created and selected, go to:
+      APIs & Services → Library
+   Search for "YouTube Data API v3" and click Enable.
+
+5. Go to:
+      APIs & Services → OAuth consent screen
+   - Choose "External"
+   - Fill in an app name, your email, and save (you can leave most
+     fields default — this app is just for you, not public).
+   - Under "Test users", add your own Google account email.
+
+6. Go to:
+      APIs & Services → Credentials
+   - Click "Create Credentials" → "OAuth client ID"
+   - Application type: "Desktop app"
+   - Give it any name and click Create.
+   - Click "Download JSON" on the credential you just made.
+
+7. Rename the downloaded file to exactly:
+      client_secret.json
+   and move it into your bot folder (same folder as bot.py).
+
+
+--------------------------------------------------------
+STEP 5: FIRST RUN & LOGIN
+--------------------------------------------------------
+
+1. In Command Prompt, inside your bot folder, run:
+      python bot.py
+
+2. The first time you run it, a browser window will pop up asking
+   you to log in with your Google account and allow access.
+   Click Allow.
+
+3. After allowing, the bot will create a file called token.json
+   in your folder automatically — this saves your login so you
+   won't need to repeat this step every time.
+
+4. If everything worked, the Command Prompt window will show
+   logs like "YouTube Bot Starting..." and the bot is now running!
+
+
+--------------------------------------------------------
+STEP 6: USING THE DASHBOARD
+--------------------------------------------------------
+
+While bot.py is running, open your browser and go to:
+      http://localhost:10000/live
+
+From there you can:
+   - Add a stream by pasting its Video ID
+   - Start/stop listening to chat
+   - Add, edit, or remove labels for each stream
+
+Leave the Command Prompt window open while you're live — closing
+it will stop the bot.
+
+
+--------------------------------------------------------
+NEED HELP?
+--------------------------------------------------------
+
+If you get stuck on any step, send me a message on Discord and
+I'll help you out
