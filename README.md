@@ -85,11 +85,5 @@ If any backup's files are missing, the bot detects this automatically at startup
 
 ## Credits
 
-- Built & maintained by [@ThemeMasterEXE](https://github.com/ThemeMasterOS)
+- Built & maintained by [Theme Master](https://github.com/ThemeMasterOS)
 - Forked from [gulraiznoorbari/YouTube_Livestream_Chatbot](https://github.com/gulraiznoorbari/YouTube_Livestream_Chatbot)
-
----
-
-## Questions / Issues?
-
-Message **@ThemeMasterEXE** on YouTube for help setting this up.
