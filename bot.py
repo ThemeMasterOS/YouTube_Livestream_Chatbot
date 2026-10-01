@@ -1140,17 +1140,25 @@ def start_health_check_server():
 threading.Thread(target=start_health_check_server, daemon=True).start()
 # -----------------------------------------------
 
-# 1. Main Project YouTube Client (Used for sending replies)
+# 1. Main Project YouTube Client (Used for sending replies) — required
 credentials_main = Authorize('client_secret.json', 'token.json', token_env='TOKEN')
 youtube_main = build('youtube', 'v3', credentials=credentials_main)
 
-# 2. Backup 1 Project YouTube Client (First fallback reader)
-credentials_backup1 = Authorize('backup_client_secret.json', 'backup_token.json', token_env='TOKEN_BACKUP')
-youtube_backup1 = build('youtube', 'v3', credentials=credentials_backup1)
+# 2. Backup 1 Project YouTube Client (First fallback reader) — optional.
+# If backup_client_secret.json / backup_token.json / TOKEN_BACKUP are all
+# missing, credentials_backup1 is None and youtube_backup1 stays None too —
+# the bot runs fine without it, just without this fallback layer.
+credentials_backup1 = Authorize('backup_client_secret.json', 'backup_token.json', token_env='TOKEN_BACKUP', optional=True)
+youtube_backup1 = build('youtube', 'v3', credentials=credentials_backup1) if credentials_backup1 else None
 
-# 3. Backup 2 Project YouTube Client (Second fallback reader)
-credentials_backup2 = Authorize('backup2_client_secret.json', 'backup2_token.json', token_env='TOKEN_BACKUP2')
-youtube_backup2 = build('youtube', 'v3', credentials=credentials_backup2)
+# 3. Backup 2 Project YouTube Client (Second fallback reader) — optional, same as above.
+credentials_backup2 = Authorize('backup2_client_secret.json', 'backup2_token.json', token_env='TOKEN_BACKUP2', optional=True)
+youtube_backup2 = build('youtube', 'v3', credentials=credentials_backup2) if credentials_backup2 else None
+
+if not youtube_backup1 and not youtube_backup2:
+    add_log("No backup credentials configured. Running with pytchat only (no API fallback).")
+elif not youtube_backup2:
+    add_log("Backup 2 not configured. Only Backup 1 is available as API fallback.")
 
 
 def getLiveChatId(LIVE_STREAM_ID):
@@ -1720,7 +1728,8 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
     Each stream gets its own independent pytchat -> Backup 1 API -> Backup 2
     API fallback chain, same as the original single-stream design.
     """
-    active_youtube_backup = youtube_backup1
+    # Pick whichever backup client is actually configured; None if neither is.
+    active_youtube_backup = youtube_backup1 or youtube_backup2
 
     if stop_flag.is_set():
         add_log(f"'{stream_name}' ({stream_id}) stopped before chat became available.")
@@ -1733,7 +1742,7 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
     # (3 attempts total) with growing delays before giving up, so a
     # startup hiccup doesn't falsely kill a real stream.
     KNOWN_UNAVAILABLE_MARKERS = ("not found.", "No active live chat found")
-    RETRY_DELAYS_SECONDS = [15, 30]  # Delay before attempt 2, then before attempt 3
+    RETRY_DELAYS_SECONDS = [15, 30, 60, 60]  # Delay before attempt 2, then before attempt 3
 
     liveChatId = None
     attempt_number = 1
@@ -1793,6 +1802,11 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
             raise Exception("Pytchat stream initialization failed.")
         add_log(f"Listening to '{stream_name}' via pytchat...")
     except Exception as e:
+        if active_youtube_backup is None:
+            add_log(f"Pytchat failed for '{stream_name}' ({e}). No backup API configured — stopping listener.")
+            with active_streams_lock:
+                active_stream_ids.discard(stream_id)
+            return
         add_log(f"Pytchat failed for '{stream_name}' ({e}). Switching to Backup API!")
         use_api_fallback = True
 
@@ -1824,6 +1838,11 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
                             next_page_token = None
                             continue
                     except Exception as theme_master:
+                        if active_youtube_backup is None:
+                            add_log(f"Pytchat failed for '{stream_name}': {theme_master} No backup API configured — stopping listener.")
+                            with active_streams_lock:
+                                active_stream_ids.discard(stream_id)
+                            return
                         add_log(f"Pytchat restore failed for '{stream_name}': {theme_master} Switching to API fallback...")
                         use_api_fallback = True
                         next_page_token = None
@@ -1883,7 +1902,7 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
 
         except HttpError as e:
             if e.resp.status == 403 and "quotaExceeded" in str(e):
-                if active_youtube_backup is youtube_backup1:
+                if active_youtube_backup is youtube_backup1 and youtube_backup2 is not None:
                     add_log(f"Backup 1 quota exceeded for '{stream_name}'. Switching to Backup 2...")
                     active_youtube_backup = youtube_backup2
                     next_page_token = None
