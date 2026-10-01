@@ -92,4 +92,4 @@ If any backup's files are missing, the bot detects this automatically at startup
 
 ## Questions / Issues?
 
-Message **@ThemeMasterEXE** on Discord for help setting this up.
+Message **@ThemeMasterEXE** on YouTube for help setting this up.
