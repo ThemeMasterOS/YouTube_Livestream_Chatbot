@@ -42,7 +42,7 @@ To check if Python is already installed:
    2. Type: python --version
    3. Press Enter.
 
-If you see a version number (like "Python 3.14.7"), you're good —
+If you see a version number (like "Python 3.12.4"), you're good —
 skip to Step 3.
 
 If you see an error like "python is not recognized":
@@ -119,30 +119,45 @@ person needs to create their own for free.
 
 
 --------------------------------------------------------
-STEP 5: FIRST RUN & LOGIN
+STEP 5: GENERATE YOUR TOKEN
+--------------------------------------------------------
+
+1. In Command Prompt, inside your bot folder, run:
+      python token_generator.py
+
+2. When asked which token to generate, type 1 (Main) and press Enter.
+
+3. A browser window will pop up asking you to log in with your
+   Google account and allow access. Click Allow.
+
+4. Once it's done, you'll see a success message and a new file
+   called token.json will appear in your folder. This saves your
+   login so you won't need to repeat this step every time.
+
+NOTE: Backup 1 and Backup 2 (options 2 and 3) are OPTIONAL. They're
+only needed if you want an extra fallback in case the main chat
+connection has issues. Most people can skip these — the bot works
+fine with just the Main token.
+
+
+--------------------------------------------------------
+STEP 6: RUN THE BOT
 --------------------------------------------------------
 
 1. In Command Prompt, inside your bot folder, run:
       python bot.py
 
-2. The first time you run it, a browser window will pop up asking
-   you to log in with your Google account and allow access.
-   Click Allow.
-
-3. After allowing, the bot will create a file called token.json
-   in your folder automatically — this saves your login so you
-   won't need to repeat this step every time.
-
-4. If everything worked, the Command Prompt window will show
+2. If everything worked, the Command Prompt window will show
    logs like "YouTube Bot Starting..." and the bot is now running!
 
 
 --------------------------------------------------------
-STEP 6: USING THE DASHBOARD
+STEP 7: USING THE DASHBOARD
 --------------------------------------------------------
 
 While bot.py is running, open your browser and go to:
       http://localhost:10000/live
+   (or whatever port is shown in your Command Prompt window)
 
 From there you can:
    - Add a stream by pasting its Video ID
@@ -158,4 +173,4 @@ NEED HELP?
 --------------------------------------------------------
 
 If you get stuck on any step, send me a message on Discord and
-I'll help you out
+I'll help you out!
