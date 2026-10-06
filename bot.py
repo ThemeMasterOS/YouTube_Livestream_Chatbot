@@ -1161,12 +1161,87 @@ elif not youtube_backup2:
     add_log("Backup 2 not configured. Only Backup 1 is available as API fallback.")
 
 
-def getLiveChatId(LIVE_STREAM_ID):
-    stream = youtube_main.videos().list(
-        part="liveStreamingDetails",
-        id=LIVE_STREAM_ID,
+# --- Quota failover: Main -> Backup 1 -> Backup 2 -> wait for 00:00 PT ---
+# YouTube quota is per Google Cloud project (not per stream), so the
+# exhausted-state is shared across every stream thread. Once a client hits
+# quotaExceeded it is skipped by everyone until the next 00:00 PT reset.
+# NOTE: Backup tokens must be authorized with the same bot account
+# (@ThemeMasterBot) so replies/timeouts come from the bot's own channel.
+class AllQuotasExhausted(Exception):
+    """Raised when Main, Backup 1 and Backup 2 have all hit their daily quota."""
+    def __init__(self, wait_seconds, utc_offset_label):
+        self.wait_seconds = wait_seconds
+        self.utc_offset_label = utc_offset_label
+        super().__init__(
+            f"All API quotas exhausted. Next reset at 00:00 PT ({utc_offset_label} UTC)."
+        )
+
+
+_api_clients = [
+    (name, client) for name, client in (
+        ("Main", youtube_main),
+        ("Backup 1", youtube_backup1),
+        ("Backup 2", youtube_backup2),
+    ) if client is not None
+]
+_quota_exhausted_until = {}  # client name -> datetime (PT) when quota resets
+_quota_lock = threading.Lock()
+_PT_ZONE = ZoneInfo("America/Los_Angeles")
+
+
+def _next_midnight_pt():
+    now_pt = datetime.now(_PT_ZONE)
+    return (now_pt + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def is_quota_exceeded_error(e):
+    return (
+        isinstance(e, HttpError)
+        and getattr(getattr(e, 'resp', None), 'status', None) == 403
+        and "quotaExceeded" in str(e)
     )
-    response = stream.execute()
+
+
+def call_with_quota_failover(make_request, purpose="API call"):
+    """
+    Runs make_request(youtube_client) against Main, then Backup 1, then
+    Backup 2, moving on only when a client reports quotaExceeded. Any other
+    error is re-raised immediately. If every client is exhausted, raises
+    AllQuotasExhausted (carrying the seconds until 00:00 PT).
+    """
+    for name, client in _api_clients:
+        with _quota_lock:
+            reset_at = _quota_exhausted_until.get(name)
+            if reset_at is not None and datetime.now(_PT_ZONE) >= reset_at:
+                del _quota_exhausted_until[name]
+                reset_at = None
+                add_log(f"Quota reset reached — {name} API is available again.")
+            if reset_at is not None:
+                continue  # Still exhausted, skip to the next client
+
+        try:
+            return make_request(client)
+        except HttpError as e:
+            if not is_quota_exceeded_error(e):
+                raise
+            with _quota_lock:
+                newly_marked = name not in _quota_exhausted_until
+                _quota_exhausted_until[name] = _next_midnight_pt()
+            if newly_marked:
+                add_log(f"{name} quota exceeded during {purpose}. Switching to next available API client...")
+
+    wait_seconds, utc_offset_label = seconds_until_next_midnight_pt()
+    raise AllQuotasExhausted(wait_seconds, utc_offset_label)
+
+
+def getLiveChatId(LIVE_STREAM_ID):
+    response = call_with_quota_failover(
+        lambda yt: yt.videos().list(
+            part="liveStreamingDetails",
+            id=LIVE_STREAM_ID,
+        ).execute(),
+        purpose="getLiveChatId",
+    )
 
     items = response.get('items', [])
     if not items:
@@ -1193,24 +1268,29 @@ def sendReplyToLiveChat(liveChatId, message, stream_name="?"):
     when that bot genuinely has moderator status.
     """
     try:
-        reply = youtube_main.liveChatMessages().insert(
-            part="snippet,authorDetails",
-            body={
-                "snippet": {
-                    "liveChatId": liveChatId,
-                    "type": "textMessageEvent",
-                    "textMessageDetails": {
-                        "messageText": message,
+        reply = call_with_quota_failover(
+            lambda yt: yt.liveChatMessages().insert(
+                part="snippet,authorDetails",
+                body={
+                    "snippet": {
+                        "liveChatId": liveChatId,
+                        "type": "textMessageEvent",
+                        "textMessageDetails": {
+                            "messageText": message,
+                        }
                     }
                 }
-            }
-        ).execute()
+            ).execute(),
+            purpose="sendReply",
+        )
         add_log(f"Bot replied in '{stream_name}': {message}")
 
         author_details = reply.get("authorDetails", {})
         is_mod = bool(author_details.get("isChatModerator") or author_details.get("isChatOwner"))
         with _mod_status_cache_lock:
             _mod_status_cache[liveChatId] = is_mod
+    except AllQuotasExhausted as e:
+        add_log(f"All API quotas exhausted — dropped reply in '{stream_name}' (resets 00:00 PT, {e.utc_offset_label} UTC): {message}")
     except Exception as e:
         add_log(f"Failed to send message in '{stream_name}': {e}")
 
@@ -1248,19 +1328,22 @@ def timeoutUser(liveChatId, userChannelId, duration_seconds, stream_name="?"):
     etc.) — so callers can tell "not a mod" apart from "something else broke".
     """
     try:
-        youtube_main.liveChatBans().insert(
-            part="snippet",
-            body={
-                "snippet": {
-                    "liveChatId": liveChatId,
-                    "type": "temporary",
-                    "banDurationSeconds": duration_seconds,
-                    "bannedUserDetails": {
-                        "channelId": userChannelId
+        call_with_quota_failover(
+            lambda yt: yt.liveChatBans().insert(
+                part="snippet",
+                body={
+                    "snippet": {
+                        "liveChatId": liveChatId,
+                        "type": "temporary",
+                        "banDurationSeconds": duration_seconds,
+                        "bannedUserDetails": {
+                            "channelId": userChannelId
+                        }
                     }
                 }
-            }
-        ).execute()
+            ).execute(),
+            purpose="timeoutUser",
+        )
         add_log(f"Timed out user (channel {userChannelId}) in '{stream_name}' for {duration_seconds}s.")
         with _mod_status_cache_lock:
             _mod_status_cache[liveChatId] = True  # A successful ban proves mod status
@@ -1278,6 +1361,9 @@ def timeoutUser(liveChatId, userChannelId, duration_seconds, stream_name="?"):
             with _mod_status_cache_lock:
                 _mod_status_cache[liveChatId] = False
         return False, permission_denied
+    except AllQuotasExhausted as e:
+        add_log(f"All API quotas exhausted — could not time out user in '{stream_name}' (resets 00:00 PT, {e.utc_offset_label} UTC).")
+        return False, False
     except Exception as e:
         add_log(f"Failed to time out user in '{stream_name}': {e}")
         return False, False
@@ -1755,6 +1841,16 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
         try:
             liveChatId = getLiveChatId(stream_id)
             add_log(f"Started listening to '{stream_name}' ({stream_id})")
+        except AllQuotasExhausted as qe:
+            add_log(f"All API quotas exhausted while connecting '{stream_name}' ({stream_id}). Waiting until 00:00 PT ({qe.utc_offset_label} UTC) to retry...")
+            deadline = time.time() + qe.wait_seconds + 5  # small buffer past the reset
+            while time.time() < deadline:
+                if stop_flag.is_set():
+                    add_log(f"'{stream_name}' ({stream_id}) stopped while waiting for quota reset.")
+                    return
+                time.sleep(1)
+            add_log(f"Quota reset time reached for '{stream_name}'. Retrying live chat ID fetch...")
+            continue  # Doesn't count against the retry attempts
         except Exception as e:
             error_text = str(e)
             is_known_unavailable = any(marker in error_text for marker in KNOWN_UNAVAILABLE_MARKERS)
@@ -1791,7 +1887,7 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
 
     last_pytchat_retry = 0
     PYTCHAT_RETRY_INTERVAL = 600
-    
+
     # Stream-end detection: count consecutive API failures
     # If we get 3+ in a row, the stream has likely ended
     consecutive_api_failures = 0
