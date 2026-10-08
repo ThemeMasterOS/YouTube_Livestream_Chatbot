@@ -215,8 +215,58 @@ def load_coins():
     return load_json_with_fallback(COINS_FILE, "coin balance(s)")
 
 
+# !gamble/!giftpoint can fire repeatedly in quick succession (e.g. someone
+# spamming !gamble). Writing to GitHub on every single call risks the same
+# kind of secondary rate limiting discussed for load_moderation() above —
+# just on the write side instead of the read side. Local disk is always
+# saved immediately (fast, no rate-limit risk, and is what callers read
+# back from moment-to-moment); the GitHub backup is debounced: the first
+# call in a quiet period starts a 30-second timer, and any further calls
+# before it fires just update what data that timer will send, rather than
+# restarting the clock — so sustained spamming still gets backed up at
+# least once every 30 seconds, rather than the backup being pushed off
+# indefinitely for as long as gambling keeps happening.
+#
+# Tradeoff accepted: if Render redeploys/crashes within that 30-second
+# window, whatever coin changes only made it to local disk (not yet
+# GitHub) could be lost, since local disk doesn't survive a cold start.
+COINS_GITHUB_BACKUP_DELAY_SECONDS = 30
+_coins_backup_timer = None
+_pending_coins_data = None
+_coins_backup_lock = threading.Lock()
+
+
+def _flush_coins_to_github():
+    global _coins_backup_timer, _pending_coins_data
+    with _coins_backup_lock:
+        data_to_send = _pending_coins_data
+        _coins_backup_timer = None
+        _pending_coins_data = None
+
+    if data_to_send is not None:
+        if _github_configured():
+            github_save_json(COINS_FILE, data_to_send, f"{len(data_to_send)} user(s)")
+        else:
+            add_log(f"GITHUB_TOKEN/GITHUB_REPO not set — skipping GitHub backup for {COINS_FILE} (local only, won't survive cold-start).")
+
+
 def save_coins(coins):
-    save_json_with_backup(COINS_FILE, coins, f"{len(coins)} user(s)")
+    # Local disk: always immediate, same as before.
+    try:
+        with open(COINS_FILE, 'w') as f:
+            json.dump(coins, f, indent=2)
+        add_log(f"{COINS_FILE} saved to local disk.")
+    except Exception as e:
+        add_log(f"Error saving local {COINS_FILE}: {e}")
+
+    # GitHub: debounced.
+    global _coins_backup_timer, _pending_coins_data
+    with _coins_backup_lock:
+        _pending_coins_data = coins
+        if _coins_backup_timer is None:
+            _coins_backup_timer = threading.Timer(COINS_GITHUB_BACKUP_DELAY_SECONDS, _flush_coins_to_github)
+            _coins_backup_timer.daemon = True
+            _coins_backup_timer.start()
 
 
 def get_user_record(coins, user_key, display_name=None):
@@ -264,7 +314,30 @@ def _default_blocklist_category(name=""):
     }
 
 
+# run_moderation_check() calls load_moderation() on every single chat
+# message across every stream — with no cache, that meant one fresh
+# GitHub API read per message, which can trip GitHub's secondary rate
+# limiting under normal chat traffic (confirmed via GitHub's own docs: a
+# 403 from an endpoint that worked moments earlier is usually the rate
+# limit, not a permission change). This short cache keeps reads local for
+# MODERATION_CACHE_TTL_SECONDS at a time; save_moderation() below updates
+# the cache immediately on every write, so edits made through /moderation
+# still apply the instant they're saved, with no perceptible delay — the
+# TTL only matters for catching an edit made directly on GitHub, outside
+# the bot, which would take up to the TTL to be picked up.
+MODERATION_CACHE_TTL_SECONDS = 60
+_moderation_cache = None
+_moderation_cache_time = 0
+_moderation_cache_lock = threading.Lock()
+
+
 def load_moderation():
+    global _moderation_cache, _moderation_cache_time
+
+    with _moderation_cache_lock:
+        if _moderation_cache is not None and (time.time() - _moderation_cache_time) < MODERATION_CACHE_TTL_SECONDS:
+            return _moderation_cache
+
     config = load_json_with_fallback(MODERATION_FILE, "moderation setting(s)")
     # Backfill structure for a fresh/empty file so callers can rely on these keys existing.
     if "blocklist_categories" not in config:
@@ -273,11 +346,21 @@ def load_moderation():
         config["streams"] = {}
     if "all_streams" not in config:
         config["all_streams"] = _default_stream_moderation()
+
+    with _moderation_cache_lock:
+        _moderation_cache = config
+        _moderation_cache_time = time.time()
+
     return config
 
 
 def save_moderation(config):
     save_json_with_backup(MODERATION_FILE, config, "moderation settings")
+
+    global _moderation_cache, _moderation_cache_time
+    with _moderation_cache_lock:
+        _moderation_cache = config
+        _moderation_cache_time = time.time()
 
 
 def get_stream_moderation_settings(config, video_id):
