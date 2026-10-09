@@ -1,4 +1,5 @@
 import os
+import copy
 import json
 import math
 import re
@@ -211,29 +212,69 @@ def save_streams(streams):
 
 # --- NeilCoins helpers ---
 
-def load_coins():
-    return load_json_with_fallback(COINS_FILE, "coin balance(s)")
-
-
-# !gamble/!giftpoint can fire repeatedly in quick succession (e.g. someone
-# spamming !gamble). Writing to GitHub on every single call risks the same
-# kind of secondary rate limiting discussed for load_moderation() above —
-# just on the write side instead of the read side. Local disk is always
-# saved immediately (fast, no rate-limit risk, and is what callers read
-# back from moment-to-moment); the GitHub backup is debounced: the first
-# call in a quiet period starts a 30-second timer, and any further calls
-# before it fires just update what data that timer will send, rather than
-# restarting the clock — so sustained spamming still gets backed up at
-# least once every 30 seconds, rather than the backup being pushed off
-# indefinitely for as long as gambling keeps happening.
+# Coins are read and written on every !gamble/!giftpoint, so they need two
+# things at once: protection from hammering GitHub (secondary rate limits),
+# and always-correct balances.
 #
-# Tradeoff accepted: if Render redeploys/crashes within that 30-second
-# window, whatever coin changes only made it to local disk (not yet
-# GitHub) could be lost, since local disk doesn't survive a cold start.
+# Local disk is saved immediately on every save_coins(), but the GitHub
+# backup is debounced: the first save in a quiet period starts a 30-second
+# timer, and further saves before it fires just update what that timer will
+# send (the clock isn't restarted, so sustained spamming is still backed up
+# at least every 30 seconds).
+#
+# Reads come from an in-memory copy that save_coins() updates immediately
+# (write-through), so the in-memory copy is the source of truth while the
+# bot is running. Reading GitHub first on every load — which load_coins()
+# used to do — is wrong once GitHub can lag up to 30 seconds behind: a
+# gamble would read the stale GitHub balance, compute from it, and write
+# the wrong result over the correct local copy.
+#
+# GitHub is only re-read when the cached copy is older than
+# COINS_CACHE_TTL_SECONDS (to pick up manual edits made on GitHub) and no
+# backup is pending, so stale GitHub data can never overwrite newer unsent
+# changes. On a cold start the cache is empty, so the first load comes from
+# GitHub as before.
+#
+# Tradeoff accepted: if Render redeploys/crashes inside the 30-second window,
+# changes that only reached local disk are lost, since Render wipes it.
 COINS_GITHUB_BACKUP_DELAY_SECONDS = 30
+COINS_CACHE_TTL_SECONDS = 60
 _coins_backup_timer = None
 _pending_coins_data = None
+_coins_cache = None
+_coins_cache_time = 0
+_coins_version = 0  # bumped on every save, so a slow GitHub fetch can't clobber a newer save
 _coins_backup_lock = threading.Lock()
+
+
+def load_coins():
+    """
+    Returns a private COPY of the coin data, never the shared cache — several
+    stream threads use coins at once, and one thread mutating a dict while
+    another serializes it would corrupt a save or crash it.
+    """
+    global _coins_cache, _coins_cache_time
+
+    with _coins_backup_lock:
+        if _coins_cache is not None:
+            fresh = (time.time() - _coins_cache_time) < COINS_CACHE_TTL_SECONDS
+            backup_pending = _pending_coins_data is not None
+            if fresh or backup_pending:
+                return copy.deepcopy(_coins_cache)
+        version_before_fetch = _coins_version
+
+    # Cache missing or stale, and nothing unsent: refresh from GitHub
+    # (network call made outside the lock so it never blocks other threads).
+    fetched = load_json_with_fallback(COINS_FILE, "coin balance(s)")
+
+    with _coins_backup_lock:
+        if _coins_version != version_before_fetch and _coins_cache is not None:
+            # A save landed while we were fetching — the cache is newer
+            # than what we just downloaded, so keep the cache.
+            return copy.deepcopy(_coins_cache)
+        _coins_cache = fetched
+        _coins_cache_time = time.time()
+        return copy.deepcopy(_coins_cache)
 
 
 def _flush_coins_to_github():
@@ -251,18 +292,27 @@ def _flush_coins_to_github():
 
 
 def save_coins(coins):
-    # Local disk: always immediate, same as before.
-    try:
-        with open(COINS_FILE, 'w') as f:
-            json.dump(coins, f, indent=2)
-        add_log(f"{COINS_FILE} saved to local disk.")
-    except Exception as e:
-        add_log(f"Error saving local {COINS_FILE}: {e}")
+    global _coins_backup_timer, _pending_coins_data, _coins_cache, _coins_cache_time, _coins_version
 
-    # GitHub: debounced.
-    global _coins_backup_timer, _pending_coins_data
+    snapshot = copy.deepcopy(coins)  # later changes by the caller must not leak in
+
     with _coins_backup_lock:
-        _pending_coins_data = coins
+        # Memory first: the very next load_coins() sees this immediately.
+        _coins_cache = snapshot
+        _coins_cache_time = time.time()
+        _coins_version += 1
+
+        # Local disk: always immediate. Done inside the lock so two threads
+        # can't interleave writes to the same file.
+        try:
+            with open(COINS_FILE, 'w') as f:
+                json.dump(snapshot, f, indent=2)
+            add_log(f"{COINS_FILE} saved to local disk.")
+        except Exception as e:
+            add_log(f"Error saving local {COINS_FILE}: {e}")
+
+        # GitHub: debounced.
+        _pending_coins_data = snapshot
         if _coins_backup_timer is None:
             _coins_backup_timer = threading.Timer(COINS_GITHUB_BACKUP_DELAY_SECONDS, _flush_coins_to_github)
             _coins_backup_timer.daemon = True
