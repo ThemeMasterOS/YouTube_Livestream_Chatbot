@@ -1612,19 +1612,32 @@ def run_moderation_check(video_id, stream_name, liveChatId, userName, userChanne
     spam_settings = get_stream_moderation_settings(config, video_id)
     is_spam = False
     if spam_settings is not None:
+        # Messages starting with "!" are bot commands (!gamble, !coins, ...)
+        # and are never treated as spam — people legitimately repeat them,
+        # and the bot's own reply cooldown already rate-limits them. They
+        # still go through the blocklist check above. Sending one also
+        # breaks the user's repeat streak, since it's a different message
+        # from whatever they sent before it.
+        is_command_message = lower_msg.startswith("!")
+
         with _moderation_state_lock:
             stream_recent = _recent_messages.setdefault(video_id, {})
             last_text, repeat_count = stream_recent.get(userChannelId, (None, 0))
 
-            if lower_msg == last_text:
-                repeat_count += 1
+            if is_command_message:
+                repeat_count = 0
+                stream_recent[userChannelId] = (None, 0)
             else:
-                repeat_count = 1
-            stream_recent[userChannelId] = (lower_msg, repeat_count)
+                if lower_msg == last_text:
+                    repeat_count += 1
+                else:
+                    repeat_count = 1
+                stream_recent[userChannelId] = (lower_msg, repeat_count)
 
-        spam_threshold = spam_settings.get("spam_threshold", DEFAULT_SPAM_THRESHOLD)
-        if repeat_count >= spam_threshold:
-            is_spam = True
+        if not is_command_message:
+            spam_threshold = spam_settings.get("spam_threshold", DEFAULT_SPAM_THRESHOLD)
+            if repeat_count >= spam_threshold:
+                is_spam = True
 
     if matched_category is None and not is_spam:
         return  # No violation of any kind
