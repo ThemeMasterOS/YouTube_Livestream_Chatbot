@@ -563,17 +563,50 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             <html>
             <head>
                 <title>Live Chat Logs</title>
-                <meta http-equiv="refresh" content="5">
                 <style>
                     body {{ background-color: #0d1117; color: #58a6ff; font-family: monospace; padding: 20px; }}
-                    h2 {{ color: #ffffff; border-bottom: 1px solid #30363d; padding-bottom: 10px; }}
+                    h2 {{ color: #ffffff; border-bottom: 1px solid #30363d; padding-bottom: 10px; padding-right: 150px; }}
                     ul {{ list-style: none; padding: 0; }}
                     li {{ padding: 6px 0; border-bottom: 1px solid #21262d; }}
+                    #pauseBtn {{
+                        position: fixed; top: 10px; right: 10px; z-index: 10;
+                        padding: 10px 16px; font-family: monospace; font-size: 14px; font-weight: bold;
+                        color: #58a6ff; background: rgba(33, 38, 45, 0.92);
+                        border: 1px solid #30363d; border-radius: 8px; cursor: pointer;
+                    }}
+                    #pauseBtn.paused {{ color: #ffffff; background: rgba(158, 106, 3, 0.95); border-color: #d29922; }}
+                    /* This page has no viewport tag, so phones render it zoomed out
+                       (~0.75x). Enlarge the button on touch screens so it's an easy tap. */
+                    @media (pointer: coarse) {{
+                        #pauseBtn {{ font-size: 34px; padding: 18px 30px; top: 14px; right: 14px; }}
+                    }}
                 </style>
             </head>
             <body>
+                <button id="pauseBtn" type="button">⏸ Pause</button>
                 <h2>🤖 YouTube Bot Live Logs (UTC)</h2>
                 <ul>{log_entries or "<li>No chat activity logged yet.</li>"}</ul>
+                <script>
+                    // Auto-refresh every 5s via a timer (not a meta refresh) so it can be
+                    // paused — a reload wipes any text you've selected to copy.
+                    (function () {{
+                        var REFRESH_MS = 5000;
+                        var btn = document.getElementById('pauseBtn');
+                        var timer = setTimeout(function () {{ location.reload(); }}, REFRESH_MS);
+                        var paused = false;
+
+                        btn.addEventListener('click', function () {{
+                            if (paused) {{
+                                location.reload();  // Resume: reload now to catch up on missed logs
+                                return;
+                            }}
+                            paused = true;
+                            clearTimeout(timer);
+                            btn.textContent = '▶ Resume';
+                            btn.classList.add('paused');
+                        }});
+                    }})();
+                </script>
             </body>
             </html>
             """
