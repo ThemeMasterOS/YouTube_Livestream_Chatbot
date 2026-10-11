@@ -647,6 +647,8 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                     <tr><td><code>!giftpoint @Username &lt;points&gt;</code></td><td>Gifts NeilCoins to another user (can't gift yourself).</td></tr>
                     <tr><td><code>!resetcoins</code></td><td>Grants +25 NeilCoins, but only if your balance is exactly 0. Max 5 uses ever.</td></tr>
                     <tr><td><code>!leaderboard</code></td><td>Links to the <code>/leaderboard</code> page (top 50 users by NeilCoins).</td></tr>
+                    <tr><td><code>!quiz</code></td><td>Starts a 3 minute tech quiz with A, B, C, D choices (one quiz at a time per stream).</td></tr>
+                    <tr><td><code>!ans a</code></td><td>Answers the quiz (a, b, c or d). The first correct answer wins +67 NeilCoins. Wrong answers cost nothing and you can try again.</td></tr>
                 </table>
             </body>
             </html>
@@ -1455,10 +1457,13 @@ def sendReplyToLiveChat(liveChatId, message, stream_name="?"):
         is_mod = bool(author_details.get("isChatModerator") or author_details.get("isChatOwner"))
         with _mod_status_cache_lock:
             _mod_status_cache[liveChatId] = is_mod
+        return True
     except AllQuotasExhausted as e:
         add_log(f"All API quotas exhausted — dropped reply in '{stream_name}' (resets 00:00 PT, {e.utc_offset_label} UTC): {message}")
+        return False
     except Exception as e:
         add_log(f"Failed to send message in '{stream_name}': {e}")
+        return False
 
 
 # --- Moderation: bot identity + moderator-status cache ---
@@ -1735,6 +1740,260 @@ def run_moderation_check(video_id, stream_name, liveChatId, userName, userChanne
             _recently_timed_out.setdefault(video_id, {})[userChannelId] = time.time()
 
 
+# --- Quiz: !quiz / !ans ---
+#
+# !quiz posts a random tech question with A-D choices and starts a
+# QUIZ_DURATION_SECONDS timer for that stream. !ans <letter> answers it:
+# the FIRST correct answer wins QUIZ_REWARD NeilCoins and ends the quiz;
+# wrong answers cost nothing and can be retried. If nobody gets it before
+# the timer runs out, a timeout message (with the answer) is posted.
+#
+# Quiz state is per stream and in memory only (a redeploy simply drops any
+# running quiz). Everything touching that state happens under _quiz_lock so
+# two correct answers at the same instant, or an answer landing exactly as
+# the timer fires, can never both win or double-pay.
+#
+# Cost notes: every bot message is 50 quota units. There are no periodic
+# countdown posts for that reason. To stop a spammer from burning quota via
+# wrong answers, each user is limited to one !ans per
+# QUIZ_ANSWER_THROTTLE_SECONDS and the stream posts at most one ❌ reply per
+# QUIZ_WRONG_REPLY_MIN_GAP_SECONDS (the answer still counts either way).
+QUIZ_DURATION_SECONDS = 180
+QUIZ_REWARD = 67
+QUIZ_ANSWER_THROTTLE_SECONDS = 2
+QUIZ_WRONG_REPLY_MIN_GAP_SECONDS = 5
+
+# (question, [four options], index of the correct option). Options are
+# shuffled each time a quiz starts. The whole chat message (question + all
+# four options + prefix/suffix) must stay within YouTube's 200-character
+# limit — a test checks every entry.
+QUIZ_QUESTIONS = [
+    ("What does CPU stand for?", ["Central Processing Unit", "Computer Personal Unit", "Core Power Unit", "Central Program Utility"], 0),
+    ("Which one is a markup language?", ["Python", "Java", "HTML", "C"], 2),
+    ("What does HTTP stand for?", ["HyperText Transfer Protocol", "High Transfer Text Process", "HyperText Transmission Program", "Host Transfer Type Protocol"], 0),
+    ("Which port does HTTPS use by default?", ["80", "21", "443", "25"], 2),
+    ("What does SQL stand for?", ["Structured Query Language", "Simple Question Logic", "Sequential Query List", "System Quick Language"], 0),
+    ("Which data structure uses FIFO order?", ["Stack", "Queue", "Tree", "Heap"], 1),
+    ("Which data structure uses LIFO order?", ["Queue", "Array", "Stack", "Graph"], 2),
+    ("What does RAM stand for?", ["Random Access Memory", "Read Access Memory", "Rapid Active Module", "Run All Memory"], 0),
+    ("Who created the Linux kernel?", ["Bill Gates", "Linus Torvalds", "Steve Jobs", "Dennis Ritchie"], 1),
+    ("What does GPU stand for?", ["General Power Unit", "Graphics Processing Unit", "Game Program Utility", "Graphical Pixel Unit"], 1),
+    ("Which one is a version control system?", ["Git", "Docker", "Nginx", "Redis"], 0),
+    ("What is decimal 5 in binary?", ["101", "110", "011", "111"], 0),
+    ("How many bits are in a byte?", ["4", "8", "16", "32"], 1),
+    ("Which symbol starts a comment in Python?", ["//", "#", "--", "/*"], 1),
+    ("What does DNS do?", ["Encrypts files", "Turns domain names into IPs", "Blocks viruses", "Compresses images"], 1),
+    ("Which one is a relational database?", ["MongoDB", "PostgreSQL", "Redis", "Neo4j"], 1),
+    ("What does URL stand for?", ["Uniform Resource Locator", "Universal Reference Link", "Unified Resource Loader", "User Request Line"], 0),
+    ("Which keyword defines a function in Python?", ["func", "define", "def", "function"], 2),
+    ("What does USB stand for?", ["Universal Serial Bus", "United System Board", "Unified Storage Block", "Universal Signal Base"], 0),
+    ("Which one is an open source OS?", ["Windows", "macOS", "Linux", "iOS"], 2),
+    ("What does CSS control on a web page?", ["Database queries", "Styling and layout", "Server routing", "Encryption"], 1),
+    ("Which protocol is used to send email?", ["FTP", "SMTP", "SSH", "DHCP"], 1),
+    ("Which one runs JavaScript on servers?", ["Node.js", "Django", "Flask", "Laravel"], 0),
+    ("What does IP stand for in IP address?", ["Internet Protocol", "Internal Program", "Interface Port", "Input Process"], 0),
+    ("What does git commit do?", ["Deletes the repo", "Saves changes to history", "Downloads code", "Merges branches"], 1),
+    ("Which logic gate outputs 1 only if both inputs are 1?", ["OR", "XOR", "AND", "NOT"], 2),
+    ("What does SSD stand for?", ["Solid State Drive", "Super Speed Disk", "Static System Data", "Secure Storage Device"], 0),
+    ("Which part executes program instructions?", ["Monitor", "CPU", "Keyboard", "Router"], 1),
+    ("What does API stand for?", ["Application Programming Interface", "Applied Program Integration", "Automated Process Input", "Application Protocol Index"], 0),
+    ("Which HTTP status code means Not Found?", ["200", "301", "404", "500"], 2),
+    ("What is a bug in software?", ["A feature", "An error or flaw", "A virus scan", "A backup"], 1),
+    ("What is the main job of a firewall?", ["Cool the CPU", "Filter network traffic", "Store passwords", "Speed up Wi-Fi"], 1),
+    ("Which language is named after a comedy group?", ["Python", "Ruby", "Swift", "Perl"], 0),
+    ("What does HTML stand for?", ["HyperText Markup Language", "High Tech Modern Language", "HyperTransfer Markup Logic", "Home Tool Markup Language"], 0),
+    ("In Python, what does len('hi') return?", ["1", "2", "3", "Error"], 1),
+    ("What is the smallest unit of data?", ["Byte", "Bit", "Kilobyte", "Word"], 1),
+    ("Which company develops the Chrome browser?", ["Microsoft", "Mozilla", "Google", "Apple"], 2),
+    ("Which tool is used to containerize apps?", ["Docker", "Excel", "Photoshop", "Notepad"], 0),
+    ("What does WWW stand for?", ["World Wide Web", "Wide Web Window", "World Web Wire", "Wireless Wide Web"], 0),
+    ("What does OS stand for?", ["Open Software", "Operating System", "Online Service", "Output Stream"], 1),
+    ("Which number system uses only 0 and 1?", ["Decimal", "Octal", "Binary", "Hex"], 2),
+    ("Which Linux command lists files?", ["ls", "cd", "rm", "mv"], 0),
+    ("What does RGB stand for?", ["Red Green Blue", "Run Graphics Boot", "Raw Gray Black", "Real Green Beam"], 0),
+    ("Which port does SSH use by default?", ["21", "22", "23", "80"], 1),
+    ("What does LAN stand for?", ["Local Area Network", "Long Access Node", "Linked Array Net", "Large Area Network"], 0),
+]
+
+_active_quizzes = {}           # stream_key -> quiz dict (see start_quiz)
+_quiz_last_answer = {}         # stream_key -> {user_key: timestamp of their last counted !ans}
+_quiz_last_wrong_reply = {}    # stream_key -> timestamp of the last ❌ reply posted
+_quiz_question_bag = []        # shuffled indices; refilled once every question has been used
+_quiz_next_id = 0
+_quiz_lock = threading.Lock()
+
+
+def _quiz_stream_key(video_id, liveChatId):
+    return video_id if video_id is not None else liveChatId
+
+
+def _is_quiz_answer_command(lower_msg):
+    parts = lower_msg.split()
+    return bool(parts) and parts[0] == "!ans"
+
+
+def _next_quiz_question():
+    """Random question, no repeats until all have been used. Caller holds _quiz_lock."""
+    global _quiz_question_bag
+    if not _quiz_question_bag:
+        _quiz_question_bag = list(range(len(QUIZ_QUESTIONS)))
+        random.shuffle(_quiz_question_bag)
+    return QUIZ_QUESTIONS[_quiz_question_bag.pop()]
+
+
+def format_quiz_message(question_text, options):
+    choices = "  ".join(f"{letter}) {text}" for letter, text in zip("ABCD", options))
+    return f"🧠 QUIZ ({QUIZ_DURATION_SECONDS // 60} min): {question_text} {choices} — reply !ans a/b/c/d"
+
+
+def _cancel_quiz(stream_key, quiz_id):
+    with _quiz_lock:
+        quiz = _active_quizzes.get(stream_key)
+        if quiz is not None and quiz["id"] == quiz_id:
+            quiz["timer"].cancel()
+            del _active_quizzes[stream_key]
+            _quiz_last_answer.pop(stream_key, None)
+
+
+def _quiz_expire(stream_key, quiz_id):
+    """Timer callback: the time limit was reached with no correct answer."""
+    with _quiz_lock:
+        quiz = _active_quizzes.get(stream_key)
+        if quiz is None or quiz["id"] != quiz_id:
+            return  # already won or cancelled
+        del _active_quizzes[stream_key]
+        _quiz_last_answer.pop(stream_key, None)
+
+    minutes = QUIZ_DURATION_SECONDS // 60
+    sendReplyToLiveChat(
+        quiz["liveChatId"],
+        f"⏰ {minutes} minute timeout has been reached! Nobody answered correctly — "
+        f"the answer was {quiz['correct_letter']}) {quiz['correct_text']}.",
+        stream_name=quiz["stream_name"],
+    )
+
+
+def start_quiz(stream_key, liveChatId, stream_name):
+    """
+    Starts a quiz on this stream. Returns "started", "already_running", or
+    "failed" (the question message couldn't be posted, so the quiz was cancelled).
+    """
+    global _quiz_next_id
+    with _quiz_lock:
+        if stream_key in _active_quizzes:
+            return "already_running"
+
+        question_text, options, correct_index = _next_quiz_question()
+        correct_text = options[correct_index]
+        shuffled = list(options)
+        random.shuffle(shuffled)
+        correct_letter = "ABCD"[shuffled.index(correct_text)]
+
+        _quiz_next_id += 1
+        quiz_id = _quiz_next_id
+        timer = threading.Timer(QUIZ_DURATION_SECONDS, _quiz_expire, args=(stream_key, quiz_id))
+        timer.daemon = True
+        _active_quizzes[stream_key] = {
+            "id": quiz_id,
+            "timer": timer,
+            "correct_letter": correct_letter,
+            "correct_text": correct_text,
+            "liveChatId": liveChatId,
+            "stream_name": stream_name,
+        }
+        _quiz_last_answer.pop(stream_key, None)
+        timer.start()
+
+    posted = sendReplyToLiveChat(liveChatId, format_quiz_message(question_text, shuffled), stream_name=stream_name)
+    if not posted:
+        _cancel_quiz(stream_key, quiz_id)
+        return "failed"
+    add_log(f"Quiz started in '{stream_name}' ({QUIZ_DURATION_SECONDS}s, answer {correct_letter}).")
+    return "started"
+
+
+def _award_quiz_coins(userName, userChannelId):
+    coins = load_coins()
+    user_key = make_user_key(userName, userChannelId)
+    record = get_user_record(coins, user_key, display_name=userName)
+    record['balance'] += QUIZ_REWARD
+    save_coins(coins)
+    return record['balance']
+
+
+def handle_quiz_answer(userName, userChannelId, lower_msg, liveChatId, last_reply_time, COOLDOWN_SECONDS, stream_name, video_id):
+    """
+    Handles "!ans <letter>". Deliberately called BEFORE the shared reply
+    cooldown check in process_command: that check drops a command outright,
+    which would silently lose answers from two people answering close
+    together. Evaluation always happens here; only the *replies* that aren't
+    a win (no-quiz / usage hints) still respect the normal cooldown, and
+    ❌ replies have their own spacing — see the cost notes above.
+    Returns the new last_reply_time.
+    """
+    now = time.time()
+    stream_key = _quiz_stream_key(video_id, liveChatId)
+    user_key = make_user_key(userName, userChannelId)
+    cooldown_active = (now - last_reply_time) < COOLDOWN_SECONDS
+
+    parts = lower_msg.split()
+    letter = parts[1].strip("().,:!") if len(parts) > 1 else ""
+    valid_letter = len(letter) == 1 and letter in "abcd"
+
+    outcome = None
+    winning_quiz = None
+    send_wrong_reply = False
+    with _quiz_lock:
+        quiz = _active_quizzes.get(stream_key)
+        if quiz is None:
+            outcome = "no_quiz"
+        elif not valid_letter:
+            outcome = "bad_usage"
+        else:
+            per_user = _quiz_last_answer.setdefault(stream_key, {})
+            if now - per_user.get(user_key, 0) < QUIZ_ANSWER_THROTTLE_SECONDS:
+                outcome = "throttled"
+            else:
+                per_user[user_key] = now
+                if letter.upper() == quiz["correct_letter"]:
+                    quiz["timer"].cancel()
+                    del _active_quizzes[stream_key]
+                    _quiz_last_answer.pop(stream_key, None)
+                    winning_quiz = quiz
+                    outcome = "correct"
+                else:
+                    outcome = "wrong"
+                    if now - _quiz_last_wrong_reply.get(stream_key, 0) >= QUIZ_WRONG_REPLY_MIN_GAP_SECONDS:
+                        _quiz_last_wrong_reply[stream_key] = now
+                        send_wrong_reply = True
+
+    if outcome == "correct":
+        new_balance = _award_quiz_coins(userName, userChannelId)
+        add_log(f"Quiz won in '{stream_name}' by {userName} (+{QUIZ_REWARD} NeilCoins).")
+        sendReplyToLiveChat(
+            liveChatId,
+            f"🎉 {userName} got it right! The answer was {winning_quiz['correct_letter']}) "
+            f"{winning_quiz['correct_text']}. +{QUIZ_REWARD} NeilCoins — new balance: {new_balance}.",
+            stream_name=stream_name,
+        )
+        return time.time()
+
+    if outcome == "wrong":
+        if send_wrong_reply:
+            sendReplyToLiveChat(liveChatId, f"❌ {userName} — not quite, try again!", stream_name=stream_name)
+        return last_reply_time  # don't extend the shared cooldown for wrong answers
+
+    if outcome == "no_quiz" and not cooldown_active:
+        sendReplyToLiveChat(liveChatId, f"{userName} No quiz is running — start one with !quiz", stream_name=stream_name)
+        return time.time()
+
+    if outcome == "bad_usage" and not cooldown_active:
+        sendReplyToLiveChat(liveChatId, f"{userName} Answer with !ans a, !ans b, !ans c or !ans d", stream_name=stream_name)
+        return time.time()
+
+    return last_reply_time  # throttled, or a hint suppressed by the cooldown
+
+
 def process_command(userName, userChannelId, message_text, liveChatId, last_reply_time, BLOCKED_BOTS, COOLDOWN_SECONDS, stream_name="?", video_id=None, is_moderator=False, is_owner=False, recent_messages=None):
     """Processes commands coming from either pytchat or backup API."""
     clean_name = userName.lower().replace('@', '')
@@ -1756,12 +2015,23 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
     lower_msg = message_text.lower()
     is_command = (
         lower_msg in ["hello", "hi", "hey", "!revertical", "!random", "!rand", "!commands", "!help", "e",
-                      "!coins", "!resetcoins", "!leaderboard"]
+                      "!coins", "!resetcoins", "!leaderboard", "!quiz"]
         or lower_msg.startswith(("!chatmbr", "!ai", "!gamble", "!giftpoint"))
+        or _is_quiz_answer_command(lower_msg)
     )
 
     if not is_command:
         return last_reply_time
+
+    # !ans is handled BEFORE the shared reply cooldown on purpose: that check
+    # drops a command entirely, which would silently lose an answer whenever
+    # two people answered within a few seconds of each other (or right after
+    # any other bot reply). handle_quiz_answer applies its own throttling.
+    if _is_quiz_answer_command(lower_msg):
+        return handle_quiz_answer(
+            userName, userChannelId, lower_msg, liveChatId, last_reply_time,
+            COOLDOWN_SECONDS, stream_name, video_id
+        )
 
     current_time = time.time()
     if current_time - last_reply_time < COOLDOWN_SECONDS:
@@ -1867,9 +2137,9 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
 
         if record['balance'] == 0:
             if record.get('resetcoins_uses', 0) < RESETCOINS_MAX_USES:
-                sendReplyToLiveChat(liveChatId, f"{userName}, you have 0 NeilCoins — use !resetcoins to get some back.", stream_name=stream_name)
+                sendReplyToLiveChat(liveChatId, f"{userName}, you have 0 NeilCoins — use !resetcoins to get some back, or try !quiz to earn more.", stream_name=stream_name)
             else:
-                sendReplyToLiveChat(liveChatId, f"{userName}, you have 0 NeilCoins and no !resetcoins left — wait for someone to giftpoint you.", stream_name=stream_name)
+                sendReplyToLiveChat(liveChatId, f"{userName}, you have 0 NeilCoins and no !resetcoins left — wait for someone to giftpoint you, or try !quiz to earn some.", stream_name=stream_name)
             save_coins(coins)
             return time.time()
 
@@ -1916,9 +2186,9 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
 
         if sender_record['balance'] == 0:
             if sender_record.get('resetcoins_uses', 0) < RESETCOINS_MAX_USES:
-                sendReplyToLiveChat(liveChatId, f"{userName}, you have 0 NeilCoins — use !resetcoins to get some back.", stream_name=stream_name)
+                sendReplyToLiveChat(liveChatId, f"{userName}, you have 0 NeilCoins — use !resetcoins to get some back, or try !quiz to earn more.", stream_name=stream_name)
             else:
-                sendReplyToLiveChat(liveChatId, f"{userName}, you have 0 NeilCoins and no !resetcoins left — wait for someone to giftpoint you.", stream_name=stream_name)
+                sendReplyToLiveChat(liveChatId, f"{userName}, you have 0 NeilCoins and no !resetcoins left — wait for someone to giftpoint you, or try !quiz to earn some.", stream_name=stream_name)
             save_coins(coins)
             return time.time()
 
@@ -1980,7 +2250,15 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
         theme_master = "https://youtube-livestream-chatbot.onrender.com/leaderboard"
         sendReplyToLiveChat(liveChatId, f"{userName} -> The leaderboard is available at {theme_master}", stream_name=stream_name)
         return time.time()
-        return time.time()
+
+    elif lower_msg == "!quiz":
+        result = start_quiz(_quiz_stream_key(video_id, liveChatId), liveChatId, stream_name)
+        if result == "already_running":
+            sendReplyToLiveChat(liveChatId, f"{userName} A quiz is already running — answer with !ans a, b, c or d", stream_name=stream_name)
+            return time.time()
+        if result == "started":
+            return time.time()
+        return last_reply_time  # "failed": the question never posted (already logged)
 
     return last_reply_time
 
