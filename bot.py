@@ -507,6 +507,33 @@ active_stream_ids = set()      # video_ids with a running listener thread
 stop_flags = {}                # video_id -> threading.Event(), set() to stop that listener
 
 
+# When a stream's channel ID is added/edited on /live while that stream is
+# already running in API-fallback mode, pytchat would otherwise not be retried
+# until the next PYTCHAT_RETRY_INTERVAL (10 minutes). This set lets the API
+# handler ask a running listener to retry pytchat right away instead.
+_force_pytchat_retry = set()
+_force_pytchat_retry_lock = threading.Lock()
+
+
+def request_pytchat_retry(video_id):
+    with _force_pytchat_retry_lock:
+        _force_pytchat_retry.add(video_id)
+
+
+def _consume_pytchat_retry_request(video_id):
+    """True (once) if a retry was requested for this stream; clears the request."""
+    with _force_pytchat_retry_lock:
+        if video_id in _force_pytchat_retry:
+            _force_pytchat_retry.discard(video_id)
+            return True
+        return False
+
+
+def _clear_pytchat_retry_request(video_id):
+    with _force_pytchat_retry_lock:
+        _force_pytchat_retry.discard(video_id)
+
+
 def start_stream_listener(video_id, label):
     """Start a listener thread for a video ID if one isn't already running."""
     with active_streams_lock:
@@ -671,6 +698,9 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                 status = "🟢 Listening" if video_id in running_ids else "⚪ Stopped"
                 label_btn_text = "✏️ Edit/Remove Label" if raw_label else "➕ Add Label"
                 escaped_label = raw_label.replace("\\", "\\\\").replace("'", "\\'")
+                raw_channel_id = (data.get('channel_id', '') or '') if isinstance(data, dict) else ''
+                channel_btn_text = "✏️ Edit/Remove Channel ID" if raw_channel_id else "➕ Add Channel ID"
+                escaped_channel_id = raw_channel_id.replace("\\", "\\\\").replace("'", "\\'")
                 stream_rows += f"""
                 <tr>
                     <td><code>{video_id}</code></td>
@@ -678,6 +708,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                     <td>{status}</td>
                     <td>
                         <button onclick="editLabel('{video_id}', '{escaped_label}')">{label_btn_text}</button>
+                        <button onclick="editChannelId('{video_id}', '{escaped_channel_id}')">{channel_btn_text}</button>
                         <button onclick="removeStream('{video_id}')">Remove</button>
                     </td>
                 </tr>
@@ -732,7 +763,14 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                         </p>
                         <input type="text" id="videoIdInput" placeholder="Video ID (e.g. BblhFWoDyWk)" style="width: 220px;">
                         <input type="text" id="labelInput" placeholder="Label (optional)" style="width: 180px;">
+                        <input type="text" id="channelIdInput" placeholder="Channel ID (optional)" style="width: 240px;">
                         <button class="add-btn" onclick="addStream()">▶ Start Listening</button>
+                        <p style="font-size: 12px; color: #8b949e; margin: 6px 0 0 0;">
+                            Channel ID is a last resort — only fill it in if pytchat can't find the channel on its own
+                            (for example, the creator turned off embedding and the lookups fail from the cloud server).
+                            Use the stream creator's channel ID (starts with UC, 24 characters), not your bot's.
+                            It's in YouTube Studio under Settings, Channel, Advanced settings.
+                        </p>
                     </div>
 
                     <h2>📺 Active Streams</h2>
@@ -751,16 +789,51 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                     function addStream() {{
                         const videoId = document.getElementById('videoIdInput').value.trim();
                         const label = document.getElementById('labelInput').value.trim();
+                        const channelId = document.getElementById('channelIdInput').value.trim();
 
                         if (!videoId) {{
                             alert('Please enter a Video ID!');
                             return;
                         }}
 
+                        if (channelId && !isValidChannelId(channelId)) {{
+                            alert(CHANNEL_ID_HELP);
+                            return;
+                        }}
+
+                        const body = {{video_id: videoId, label: label}};
+                        if (channelId) body.channel_id = channelId;  // omitted = leave any saved one untouched
+
                         fetch('/api/streams', {{
                             method: 'POST',
                             headers: {{'Content-Type': 'application/json'}},
-                            body: JSON.stringify({{video_id: videoId, label: label}})
+                            body: JSON.stringify(body)
+                        }}).then(r => r.json()).then(data => {{
+                            alert(data.message);
+                            location.reload();
+                        }}).catch(e => alert('Error: ' + e));
+                    }}
+
+                    const CHANNEL_ID_HELP = 'That is not a valid channel ID. It should start with UC and be 24 characters long.';
+                    function isValidChannelId(value) {{
+                        return /^UC[0-9A-Za-z_-]{{22}}$/.test(value);
+                    }}
+
+                    function editChannelId(videoId, currentChannelId) {{
+                        const result = prompt('Channel ID for this stream (starts with UC). Leave blank to remove:', currentChannelId);
+                        if (result === null) return;  // Cancelled
+
+                        const newChannelId = result.trim();
+                        if (newChannelId && !isValidChannelId(newChannelId)) {{
+                            alert(CHANNEL_ID_HELP);
+                            return;
+                        }}
+
+                        // Only video_id + channel_id are sent, so the saved label is left alone.
+                        fetch('/api/streams', {{
+                            method: 'POST',
+                            headers: {{'Content-Type': 'application/json'}},
+                            body: JSON.stringify({{video_id: videoId, channel_id: newChannelId}})
                         }}).then(r => r.json()).then(data => {{
                             alert(data.message);
                             location.reload();
@@ -832,10 +905,13 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                         let completed = 0;
                         videoIds.forEach(videoId => {{
                             const label = (parsed[videoId] && parsed[videoId].label) || '';
+                            const channelId = (parsed[videoId] && parsed[videoId].channel_id) || '';
+                            const restoreBody = {{video_id: videoId, label: label}};
+                            if (channelId) restoreBody.channel_id = channelId;
                             fetch('/api/streams', {{
                                 method: 'POST',
                                 headers: {{'Content-Type': 'application/json'}},
-                                body: JSON.stringify({{video_id: videoId, label: label}})
+                                body: JSON.stringify(restoreBody)
                             }}).finally(() => {{
                                 completed++;
                                 if (completed === videoIds.length) {{
@@ -1133,7 +1209,13 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                 data = json.loads(body.decode('utf-8'))
 
                 video_id = data.get('video_id', '').strip()
-                label = data.get('label', '').strip()
+                # label / channel_id are each optional in the request. A field that
+                # is ABSENT is left unchanged; a field that is present but blank
+                # clears it. (Editing only the label must not wipe the channel ID,
+                # and vice versa.)
+                has_label_field = 'label' in data
+                has_channel_field = 'channel_id' in data
+                channel_id = (data.get('channel_id') or '').strip()
 
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -1143,14 +1225,48 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                     self.wfile.write(json.dumps({"message": "Video ID is required!"}).encode("utf-8"))
                     return
 
+                if channel_id and not pytchat_oembed_patch.is_valid_channel_id(channel_id):
+                    self.wfile.write(json.dumps({
+                        "message": "That is not a valid channel ID. It should start with UC and be 24 characters long. Nothing was saved."
+                    }).encode("utf-8"))
+                    return
+
                 streams = load_streams()
-                streams[video_id] = {"label": label}
+                existing = streams.get(video_id)
+                if not isinstance(existing, dict):
+                    existing = {}
+                old_channel_id = existing.get('channel_id', '')
+
+                label = data.get('label', '').strip() if has_label_field else existing.get('label', '')
+                record = dict(existing)  # keep any other saved fields
+                record['label'] = label
+                if has_channel_field:
+                    if channel_id:
+                        record['channel_id'] = channel_id
+                    else:
+                        record.pop('channel_id', None)
+                streams[video_id] = record
                 save_streams(streams)
 
+                # Keep the pytchat patch's last-resort lookup in sync with what was saved.
+                pytchat_oembed_patch.set_manual_channel_id(video_id, record.get('channel_id'))
+
+                channel_changed = has_channel_field and channel_id != old_channel_id
                 started = start_stream_listener(video_id, label or video_id)
                 if started:
                     self.wfile.write(json.dumps({
                         "message": f"Started listening to '{label or video_id}'! Check /logs to confirm connection."
+                    }).encode("utf-8"))
+                elif channel_changed and channel_id:
+                    # Already running (likely in API-fallback mode) — ask it to retry pytchat now
+                    # instead of waiting for the next scheduled retry.
+                    request_pytchat_retry(video_id)
+                    self.wfile.write(json.dumps({
+                        "message": f"Channel ID saved for '{label or video_id}'. Retrying pytchat now — check /logs."
+                    }).encode("utf-8"))
+                elif channel_changed:
+                    self.wfile.write(json.dumps({
+                        "message": f"Channel ID removed for '{label or video_id}'."
                     }).encode("utf-8"))
                 else:
                     self.wfile.write(json.dumps({
@@ -1166,6 +1282,8 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                     save_streams(streams)
 
                 stop_stream_listener(video_id)
+                pytchat_oembed_patch.set_manual_channel_id(video_id, None)
+                _clear_pytchat_retry_request(video_id)
 
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -2273,6 +2391,8 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
     Each stream gets its own independent pytchat -> Backup 1 API -> Backup 2
     API fallback chain, same as the original single-stream design.
     """
+    _clear_pytchat_retry_request(stream_id)  # a brand-new listener tries pytchat first anyway
+
     # Pick whichever backup client is actually configured; None if neither is.
     active_youtube_backup = youtube_backup1 or youtube_backup2
 
@@ -2369,7 +2489,16 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
         try:
             current_time = time.time()
 
-            if use_api_fallback and (current_time - last_pytchat_retry > PYTCHAT_RETRY_INTERVAL):
+            # Always consume a pending "retry now" request (set when a channel ID is
+            # saved on /live), even if we're not in fallback mode — otherwise a request
+            # made while pytchat was healthy would linger and trigger a pointless
+            # retry the next time the stream falls back.
+            retry_requested = _consume_pytchat_retry_request(stream_id)
+
+            if use_api_fallback and (
+                current_time - last_pytchat_retry > PYTCHAT_RETRY_INTERVAL
+                or retry_requested
+            ):
                 add_log(f"Attempting to restore pytchat for '{stream_name}'...")
                 last_pytchat_retry = current_time
                 try:
@@ -2540,6 +2669,12 @@ def main():
     add_log("🤖 YouTube Bot Starting...")
     add_log("=" * 60)
 
+    # Log whenever pytchat has to fall back to a channel ID entered on /live
+    # (i.e. both the oEmbed and HTML-scrape lookups failed for that video).
+    pytchat_oembed_patch.set_manual_used_callback(
+        lambda vid, cid: add_log(f"oEmbed and HTML-scrape lookups failed for '{vid}' — using the manual channel ID instead.")
+    )
+
     streams = load_streams()
 
     if not streams:
@@ -2548,6 +2683,18 @@ def main():
         add_log("📝 Add a video ID there to start listening!")
     else:
         add_log(f"✅ Found {len(streams)} saved stream(s). Starting listeners...")
+
+        # Register saved manual channel IDs BEFORE any listener starts, so pytchat's
+        # last-resort lookup can use them on the very first connection attempt.
+        manual_count = 0
+        for video_id, data in streams.items():
+            manual_id = data.get('channel_id') if isinstance(data, dict) else None
+            if manual_id and pytchat_oembed_patch.is_valid_channel_id(manual_id):
+                pytchat_oembed_patch.set_manual_channel_id(video_id, manual_id)
+                manual_count += 1
+        if manual_count:
+            add_log(f"Registered {manual_count} manual channel ID(s) from saved streams.")
+
         for video_id, data in streams.items():
             label = data.get('label') or video_id
             start_stream_listener(video_id, label)
