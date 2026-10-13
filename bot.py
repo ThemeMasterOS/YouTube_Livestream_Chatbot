@@ -62,6 +62,7 @@ COINS_FILE = "coins_config.json"
 DEFAULT_STARTING_COINS = 100
 RESETCOINS_GRANT = 25
 RESETCOINS_MAX_USES = 5
+ANGRYREVERTICAL_PENALTY = 1000
 
 # --- Moderation Storage ---
 MODERATION_FILE = "moderation_config.json"
@@ -673,6 +674,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                     <tr><td><code>!gamble &lt;number&gt;</code></td><td>Bets that many NeilCoins — 50/50 chance to double it or lose it.</td></tr>
                     <tr><td><code>!giftpoint @Username &lt;points&gt;</code></td><td>Gifts NeilCoins to another user (can't gift yourself).</td></tr>
                     <tr><td><code>!resetcoins</code></td><td>Grants +25 NeilCoins, but only if your balance is exactly 0. Max 5 uses ever.</td></tr>
+                    <tr><td><code>!angryrevertical</code></td><td>Lose 1,000 NeilCoins, but only if your balance is above 1,000.</td></tr>
                     <tr><td><code>!leaderboard</code></td><td>Links to the <code>/leaderboard</code> page (top 50 users by NeilCoins).</td></tr>
                     <tr><td><code>!quiz</code></td><td>Starts a 3 minute tech quiz with A, B, C, D choices (one quiz at a time per stream).</td></tr>
                     <tr><td><code>!ans a</code></td><td>Answers the quiz (a, b, c or d). The first correct answer wins +67 NeilCoins. Wrong answers cost nothing and you can try again.</td></tr>
@@ -2133,7 +2135,7 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
     lower_msg = message_text.lower()
     is_command = (
         lower_msg in ["hello", "hi", "hey", "!revertical", "!random", "!rand", "!commands", "!help", "e",
-                      "!coins", "!resetcoins", "!leaderboard", "!quiz"]
+                      "!coins", "!resetcoins", "!leaderboard", "!quiz", "!angryrevertical"]
         or lower_msg.startswith(("!chatmbr", "!ai", "!gamble", "!giftpoint"))
         or _is_quiz_answer_command(lower_msg)
     )
@@ -2362,6 +2364,32 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
 
         uses_left = RESETCOINS_MAX_USES - record['resetcoins_uses']
         sendReplyToLiveChat(liveChatId, f"{userName} got +{RESETCOINS_GRANT} NeilCoins! Balance: {record['balance']} ({uses_left} reset(s) left).", stream_name=stream_name)
+        return time.time()
+
+    elif lower_msg == "!angryrevertical":
+        coins = load_coins()
+        user_key = make_user_key(userName, userChannelId)
+        record = get_user_record(coins, user_key, display_name=userName)
+
+        if record['balance'] > ANGRYREVERTICAL_PENALTY:
+            record['balance'] -= ANGRYREVERTICAL_PENALTY
+            save_coins(coins)
+            sendReplyToLiveChat(
+                liveChatId,
+                f"dawg WHO said “angryrevertical” 😭✌️🥀 was it {userName}!? "
+                f"That's it, imma lose {ANGRYREVERTICAL_PENALTY:,} NeilCoins. "
+                f"New balance: {record['balance']}",
+                stream_name=stream_name
+            )
+        else:
+            save_coins(coins)  # Persist in case this created a brand-new user record
+            sendReplyToLiveChat(
+                liveChatId,
+                f"dawg WHO said “angryrevertical” 😭✌️🥀 was it {userName}!? "
+                f"Wait, u have {record['balance']} NeilCoins???? "
+                f"Ohhh, I won't lose {ANGRYREVERTICAL_PENALTY:,} NeilCoins for now",
+                stream_name=stream_name
+            )
         return time.time()
 
     elif lower_msg == "!leaderboard":
