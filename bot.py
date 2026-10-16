@@ -11,10 +11,11 @@ import urllib.parse
 import urllib.request
 import urllib.error
 import base64
+import html as html_lib
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from collections import deque
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from auth import Authorize
@@ -52,7 +53,9 @@ def safe_pytchat_create(video_id):
         signal.signal = original_signal
 
 # --- Global Log Storage (Holds last 100 entries) ---
-chat_logs = deque(maxlen=100)
+chat_logs = deque(maxlen=100)   # holds (id, text) tuples
+_log_lock = threading.Lock()
+_log_counter = 0                # monotonically increasing log ID
 
 # --- Live Streams Storage ---
 STREAMS_FILE = "streams_config.json"
@@ -473,7 +476,10 @@ def add_log(message):
     """Formats logs with a 24-hour UTC timestamp and pushes to memory and stdout."""
     utc_timestamp = time.strftime("[%H:%M:%S UTC]", time.gmtime())
     entry = f"{utc_timestamp} {message}"
-    chat_logs.append(entry)
+    global _log_counter
+    with _log_lock:
+        _log_counter += 1
+        chat_logs.append((_log_counter, entry))
     print(entry, flush=True)
 
 
@@ -576,69 +582,255 @@ def mark_stream_stopped(video_id):
         active_stream_ids.discard(video_id)
 
 
+
+def get_logs_since(since_id):
+    """Return (latest_id, [{'id':..,'text':..}, ...]) for entries newer than since_id, oldest first."""
+    with _log_lock:
+        snapshot = list(chat_logs)
+        latest = _log_counter
+    return latest, [{"id": i, "text": t} for i, t in snapshot if i > since_id]
+
+
+def get_leaderboard_rows():
+    """Top 50 users as plain dicts, shared by the /leaderboard page and /api/leaderboard."""
+    coins = load_coins()
+    ranked = sorted(coins.values(), key=lambda r: r.get('balance', 0), reverse=True)[:50]
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    return [
+        {
+            "rank": medals.get(i, f"#{i}"),
+            "name": r.get('name', 'Unknown'),
+            "balance": r.get('balance', 0),
+            "resets": f"{r.get('resetcoins_uses', 0)}/{RESETCOINS_MAX_USES}",
+        }
+        for i, r in enumerate(ranked, start=1)
+    ]
+
+
+# Plain (non-f) strings so JS/CSS braces don't need escaping. Placeholders are
+# swapped in with .replace().
+LOGS_PAGE_HTML = """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Live Chat Logs</title>
+    <style>
+        body { background-color: #0d1117; color: #58a6ff; font-family: monospace; padding: 20px; }
+        h2 { color: #ffffff; border-bottom: 1px solid #30363d; padding-bottom: 10px; padding-right: 150px; }
+        ul { list-style: none; padding: 0; }
+        li { padding: 6px 0; border-bottom: 1px solid #21262d; word-break: break-word; }
+        #status { color: #8b949e; font-size: 12px; margin: 0 0 8px; min-height: 14px; }
+        #status.err { color: #d29922; }
+        #pauseBtn {
+            position: fixed; top: 10px; right: 10px; z-index: 10;
+            padding: 10px 16px; font-family: monospace; font-size: 14px; font-weight: bold;
+            color: #58a6ff; background: rgba(33, 38, 45, 0.92);
+            border: 1px solid #30363d; border-radius: 8px; cursor: pointer;
+        }
+        #pauseBtn.paused { color: #ffffff; background: rgba(158, 106, 3, 0.95); border-color: #d29922; }
+        @media (pointer: coarse) {
+            #pauseBtn { font-size: 20px; padding: 12px 20px; top: 10px; right: 10px; }
+        }
+    </style>
+</head>
+<body>
+    <button id="pauseBtn" type="button">⏸ Pause</button>
+    <h2>🤖 YouTube Bot Live Logs (UTC)</h2>
+    <p id="status"></p>
+    <ul id="logList">__ITEMS__</ul>
+    <script>
+        // Polls /api/logs for new entries and prepends only those, so the rest of
+        // the page (and any text you've selected) is never touched.
+        (function () {
+            var POLL_MS = 5000, MAX_ITEMS = 100;
+            var list = document.getElementById('logList');
+            var btn = document.getElementById('pauseBtn');
+            var statusEl = document.getElementById('status');
+            var lastId = __LATEST_ID__;
+            var paused = false, timer = null, failures = 0, inFlight = false;
+
+            function setStatus(msg, isErr) {
+                statusEl.textContent = msg;
+                statusEl.className = isErr ? 'err' : '';
+            }
+
+            function addEntries(entries) {
+                var placeholder = document.getElementById('emptyNote');
+                if (placeholder && entries.length) placeholder.remove();
+                entries.forEach(function (e) {          // oldest -> newest
+                    var li = document.createElement('li');
+                    li.textContent = e.text;            // textContent = no HTML injection
+                    list.insertBefore(li, list.firstChild);
+                    lastId = Math.max(lastId, e.id);
+                });
+                while (list.children.length > MAX_ITEMS) list.removeChild(list.lastChild);
+            }
+
+            function poll() {
+                if (inFlight) return;
+                inFlight = true;
+                fetch('/api/logs?since=' + lastId, { cache: 'no-store' })
+                    .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+                    .then(function (data) {
+                        failures = 0;
+                        // Server restarted (IDs reset) -> reload once to resync.
+                        if (data.latest < lastId) { location.reload(); return; }
+                        addEntries(data.entries);
+                        setStatus('Updated ' + new Date().toLocaleTimeString('en-GB'), false);
+                    })
+                    .catch(function () {
+                        failures++;
+                        if (failures >= 2) setStatus('Reconnecting…', true);
+                    })
+                    .then(function () { inFlight = false; });
+            }
+
+            function start() { poll(); timer = setInterval(poll, POLL_MS); }
+            function stop() { clearInterval(timer); timer = null; }
+
+            btn.addEventListener('click', function () {
+                if (paused) {
+                    paused = false;
+                    btn.textContent = '⏸ Pause';
+                    btn.classList.remove('paused');
+                    start();                            // catches up instantly, no reload
+                } else {
+                    paused = true;
+                    stop();
+                    btn.textContent = '▶ Resume';
+                    btn.classList.add('paused');
+                    setStatus('Paused', false);
+                }
+            });
+
+            timer = setInterval(poll, POLL_MS);
+        })();
+    </script>
+</body>
+</html>
+"""
+
+LEADERBOARD_PAGE_HTML = """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>NeilCoins Leaderboard</title>
+    <style>
+        body { background-color: #0d1117; color: #c9d1d9; font-family: sans-serif; padding: 20px; }
+        h2 { color: #d29922; border-bottom: 1px solid #30363d; padding-bottom: 10px; }
+        .container { max-width: 700px; margin: 0 auto; }
+        table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+        th, td { text-align: left; padding: 12px; border-bottom: 1px solid #21262d; }
+        th { color: #d29922; background: #161b22; }
+        tbody tr:first-child td { font-weight: bold; }
+        p.note { color: #8b949e; font-size: 13px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>🏆 NeilCoins Leaderboard</h2>
+        <p class="note"><span id="count">__COUNT__</span> user(s) shown. New viewers start with __START__ NeilCoins.
+            Updates every 30 seconds<span id="updated"></span>.</p>
+        <table>
+            <thead><tr><th>Rank</th><th>User</th><th>NeilCoins</th><th>Resets Used</th></tr></thead>
+            <tbody id="rows">__ROWS__</tbody>
+        </table>
+    </div>
+    <script>
+        // Fetches /api/leaderboard every 30s and rebuilds the table only if the
+        // data actually changed, so selected text survives unchanged refreshes.
+        (function () {
+            var tbody = document.getElementById('rows');
+            var countEl = document.getElementById('count');
+            var updatedEl = document.getElementById('updated');
+            var lastJson = null, inFlight = false;
+
+            function cell(tr, text) {
+                var td = document.createElement('td');
+                td.textContent = text;
+                tr.appendChild(td);
+            }
+
+            function render(rows) {
+                tbody.textContent = '';
+                if (!rows.length) {
+                    var tr = document.createElement('tr');
+                    var td = document.createElement('td');
+                    td.colSpan = 4;
+                    td.textContent = 'No NeilCoins data yet.';
+                    tr.appendChild(td);
+                    tbody.appendChild(tr);
+                } else {
+                    rows.forEach(function (r) {
+                        var tr = document.createElement('tr');
+                        cell(tr, r.rank);
+                        cell(tr, r.name);
+                        cell(tr, Number(r.balance).toLocaleString('en-US'));
+                        cell(tr, r.resets);
+                        tbody.appendChild(tr);
+                    });
+                }
+                countEl.textContent = 'Top ' + rows.length;
+            }
+
+            function poll() {
+                if (inFlight) return;
+                inFlight = true;
+                fetch('/api/leaderboard', { cache: 'no-store' })
+                    .then(function (r) { if (!r.ok) throw new Error(r.status); return r.text(); })
+                    .then(function (txt) {
+                        if (txt !== lastJson) {
+                            // First poll only seeds lastJson if the page already matches.
+                            if (lastJson !== null) render(JSON.parse(txt).rows);
+                            lastJson = txt;
+                        }
+                        updatedEl.textContent = ' (last checked ' + new Date().toLocaleTimeString('en-GB') + ')';
+                    })
+                    .catch(function () {})
+                    .then(function () { inFlight = false; });
+            }
+
+            poll();
+            setInterval(poll, 30000);
+        })();
+    </script>
+</body>
+</html>
+"""
+
 # --- Render Port Binding & HTTP Server ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == "/logs":
+        if self.path.split("?")[0] == "/api/logs":
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            try:
+                since_id = int(query.get("since", ["0"])[0])
+            except ValueError:
+                since_id = 0
+            latest_id, entries = get_logs_since(since_id)
+            body = json.dumps({"latest": latest_id, "entries": entries}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif self.path == "/logs":
+            latest_id, entries = get_logs_since(0)
+            items = "".join(
+                f"<li>{html_lib.escape(e['text'])}</li>" for e in reversed(entries)
+            ) or "<li id='emptyNote'>No chat activity logged yet.</li>"
+            page = (LOGS_PAGE_HTML
+                    .replace("__ITEMS__", items)
+                    .replace("__LATEST_ID__", str(latest_id)))
+            body = page.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-
-            log_entries = "".join([f"<li>{item}</li>" for item in reversed(chat_logs)])
-
-            html_content = f"""
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <title>Live Chat Logs</title>
-                <style>
-                    body {{ background-color: #0d1117; color: #58a6ff; font-family: monospace; padding: 20px; }}
-                    h2 {{ color: #ffffff; border-bottom: 1px solid #30363d; padding-bottom: 10px; padding-right: 150px; }}
-                    ul {{ list-style: none; padding: 0; }}
-                    li {{ padding: 6px 0; border-bottom: 1px solid #21262d; }}
-                    #pauseBtn {{
-                        position: fixed; top: 10px; right: 10px; z-index: 10;
-                        padding: 10px 16px; font-family: monospace; font-size: 14px; font-weight: bold;
-                        color: #58a6ff; background: rgba(33, 38, 45, 0.92);
-                        border: 1px solid #30363d; border-radius: 8px; cursor: pointer;
-                    }}
-                    #pauseBtn.paused {{ color: #ffffff; background: rgba(158, 106, 3, 0.95); border-color: #d29922; }}
-                    /* This page has no viewport tag, so phones render it zoomed out
-                       (~0.75x). Enlarge the button on touch screens so it's an easy tap. */
-                    @media (pointer: coarse) {{
-                        #pauseBtn {{ font-size: 34px; padding: 18px 30px; top: 14px; right: 14px; }}
-                    }}
-                </style>
-            </head>
-            <body>
-                <button id="pauseBtn" type="button">⏸ Pause</button>
-                <h2>🤖 YouTube Bot Live Logs (UTC)</h2>
-                <ul>{log_entries or "<li>No chat activity logged yet.</li>"}</ul>
-                <script>
-                    // Auto-refresh every 5s via a timer (not a meta refresh) so it can be
-                    // paused — a reload wipes any text you've selected to copy.
-                    (function () {{
-                        var REFRESH_MS = 5000;
-                        var btn = document.getElementById('pauseBtn');
-                        var timer = setTimeout(function () {{ location.reload(); }}, REFRESH_MS);
-                        var paused = false;
-
-                        btn.addEventListener('click', function () {{
-                            if (paused) {{
-                                location.reload();  // Resume: reload now to catch up on missed logs
-                                return;
-                            }}
-                            paused = true;
-                            clearTimeout(timer);
-                            btn.textContent = '▶ Resume';
-                            btn.classList.add('paused');
-                        }});
-                    }})();
-                </script>
-            </body>
-            </html>
-            """
-            self.wfile.write(html_content.encode("utf-8"))
+            self.wfile.write(body)
 
         elif self.path == "/commands":
             self.send_response(200)
@@ -929,65 +1121,32 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             """
             self.wfile.write(html_content.encode("utf-8"))
 
+        elif self.path.split("?")[0] == "/api/leaderboard":
+            body = json.dumps({"rows": get_leaderboard_rows()}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         elif self.path == "/leaderboard":
+            rows = get_leaderboard_rows()
+            rows_html = "".join(
+                "<tr><td>{}</td><td>{}</td><td>{:,}</td><td>{}</td></tr>".format(
+                    r["rank"], html_lib.escape(str(r["name"])), r["balance"], r["resets"])
+                for r in rows
+            ) or "<tr><td colspan='4'>No NeilCoins data yet.</td></tr>"
+            page = (LEADERBOARD_PAGE_HTML
+                    .replace("__ROWS__", rows_html)
+                    .replace("__COUNT__", f"Top {len(rows)}")
+                    .replace("__START__", str(DEFAULT_STARTING_COINS)))
+            body = page.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-
-            coins = load_coins()
-            ranked = sorted(coins.values(), key=lambda r: r.get('balance', 0), reverse=True)[:50]
-
-            medal_for_rank = {1: "🥇", 2: "🥈", 3: "🥉"}
-            leaderboard_rows = ""
-            for i, record in enumerate(ranked, start=1):
-                medal = medal_for_rank.get(i, f"#{i}")
-                name = record.get('name', 'Unknown')
-                balance = record.get('balance', 0)
-                resets = record.get('resetcoins_uses', 0)
-                leaderboard_rows += f"""
-                <tr>
-                    <td>{medal}</td>
-                    <td>{name}</td>
-                    <td>{balance:,}</td>
-                    <td>{resets}/{RESETCOINS_MAX_USES}</td>
-                </tr>
-                """
-
-            html_content = f"""
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <title>NeilCoins Leaderboard</title>
-                <meta http-equiv="refresh" content="30">
-                <style>
-                    body {{ background-color: #0d1117; color: #c9d1d9; font-family: sans-serif; padding: 20px; }}
-                    h2 {{ color: #d29922; border-bottom: 1px solid #30363d; padding-bottom: 10px; }}
-                    .container {{ max-width: 700px; margin: 0 auto; }}
-                    table {{ width: 100%; border-collapse: collapse; margin-top: 15px; }}
-                    th, td {{ text-align: left; padding: 12px; border-bottom: 1px solid #21262d; }}
-                    th {{ color: #d29922; background: #161b22; }}
-                    tr:first-child td {{ font-weight: bold; }}
-                    p.note {{ color: #8b949e; font-size: 13px; }}
-                </style>
-            </head>
-            <body>
-                <div class="container">
-                    <h2>🏆 NeilCoins Leaderboard</h2>
-                    <p class="note">Top {len(ranked)} user(s) shown. New viewers start with {DEFAULT_STARTING_COINS} NeilCoins. Auto-refreshes every 30 seconds.</p>
-                    <table>
-                        <tr>
-                            <th>Rank</th>
-                            <th>User</th>
-                            <th>NeilCoins</th>
-                            <th>Resets Used</th>
-                        </tr>
-                        {leaderboard_rows or "<tr><td colspan='4'>No NeilCoins data yet.</td></tr>"}
-                    </table>
-                </div>
-            </body>
-            </html>
-            """
-            self.wfile.write(html_content.encode("utf-8"))
+            self.wfile.write(body)
 
         elif self.path == "/moderation":
             self.send_response(200)
@@ -1422,7 +1581,8 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
 
 def start_health_check_server():
     port = int(os.getenv("PORT", 10000))
-    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    server = ThreadingHTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    server.daemon_threads = True
     server.serve_forever()
 
 threading.Thread(target=start_health_check_server, daemon=True).start()
