@@ -12,9 +12,12 @@ import urllib.request
 import urllib.error
 import base64
 import html as html_lib
+import hmac
+import hashlib
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from collections import deque
+from http.cookies import SimpleCookie
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -799,10 +802,296 @@ LEADERBOARD_PAGE_HTML = """<!DOCTYPE html>
 </html>
 """
 
+
+# ---------------------------------------------------------------------------
+# Sudo mode: /live and /moderation are read-only unless the browser carries a
+# valid signed cookie. The password lives in the ADMIN_PASSWORD env var (never
+# in the code or repo). SESSION_SECRET is optional; if unset, the signing key
+# is derived from the password, so changing the password logs everyone out.
+# ---------------------------------------------------------------------------
+SUDO_COOKIE_NAME = "sudo_session"
+SUDO_SESSION_SECONDS = 30 * 24 * 60 * 60      # 30 days
+SUDO_MAX_FAILS = 5
+SUDO_LOCKOUT_SECONDS = 15 * 60                # 15 minutes
+ADMIN_PASSWORD = (os.getenv("ADMIN_PASSWORD") or "").strip()
+_SESSION_KEY = (os.getenv("SESSION_SECRET") or ("neilcoins-sudo:" + ADMIN_PASSWORD)).encode("utf-8")
+_login_attempts = {}
+_login_lock = threading.Lock()
+SUDO_AUTH_ROUTES = ("/api/auth/login", "/api/auth/logout")
+
+if not ADMIN_PASSWORD:
+    print("⚠️ ADMIN_PASSWORD is not set: sudo mode is disabled and /live + /moderation stay read-only.", flush=True)
+
+
+def _sudo_sign(expiry):
+    return hmac.new(_SESSION_KEY, f"sudo:{expiry}".encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def make_sudo_token():
+    expiry = int(time.time()) + SUDO_SESSION_SECONDS
+    return f"{expiry}.{_sudo_sign(expiry)}"
+
+
+def verify_sudo_token(token):
+    if not ADMIN_PASSWORD or not token:
+        return False
+    try:
+        expiry_text, signature = token.split(".", 1)
+        expiry = int(expiry_text)
+    except ValueError:
+        return False
+    if expiry < time.time():
+        return False
+    return hmac.compare_digest(signature, _sudo_sign(expiry))
+
+
+def sudo_lockout_remaining(ip):
+    """Seconds left on this IP's lockout, or 0 if it may try."""
+    with _login_lock:
+        record = _login_attempts.get(ip)
+        if record and record["locked_until"] > time.time():
+            return int(record["locked_until"] - time.time()) + 1
+    return 0
+
+
+def sudo_register_failure(ip):
+    now = time.time()
+    with _login_lock:
+        record = _login_attempts.setdefault(ip, {"fails": 0, "locked_until": 0})
+        if record["locked_until"] and record["locked_until"] <= now:
+            record["fails"] = 0
+            record["locked_until"] = 0
+        record["fails"] += 1
+        if record["fails"] >= SUDO_MAX_FAILS:
+            record["locked_until"] = now + SUDO_LOCKOUT_SECONDS
+        if len(_login_attempts) > 500:   # keep the table small
+            for key in [k for k, v in _login_attempts.items() if v["locked_until"] <= now and v["fails"] < SUDO_MAX_FAILS]:
+                del _login_attempts[key]
+
+
+def sudo_clear_failures(ip):
+    with _login_lock:
+        _login_attempts.pop(ip, None)
+
+
+# Injected just before </body> on /live and /moderation. Plain string, so
+# JS/CSS braces need no escaping; __ADMIN__ becomes true/false.
+SUDO_SNIPPET = """
+<style>
+    body { padding-top: 64px !important; }
+    #sudoBar { position: fixed; top: 10px; left: 10px; right: 10px; display: flex;
+               justify-content: space-between; align-items: center; gap: 8px;
+               z-index: 1000; pointer-events: none; font-family: sans-serif; }
+    #sudoStatus { pointer-events: auto; font-size: 12px; padding: 7px 10px; border-radius: 8px;
+                  background: rgba(22, 27, 34, 0.92); border: 1px solid #30363d; color: #8b949e; }
+    #sudoStatus.on { color: #3fb950; border-color: #238636; }
+    #sudoBtn { pointer-events: auto; margin: 0 !important; padding: 10px 16px !important;
+               font-size: 14px; font-weight: bold; color: #58a6ff !important;
+               background: rgba(33, 38, 45, 0.95) !important; border: 1px solid #30363d !important;
+               border-radius: 8px !important; cursor: pointer; }
+    #sudoBtn.on { color: #ffffff !important; background: rgba(158, 106, 3, 0.95) !important; border-color: #d29922 !important; }
+    @media (pointer: coarse) { #sudoBtn { font-size: 16px; padding: 12px 18px !important; } }
+    button:disabled, input:disabled, textarea:disabled { opacity: 0.45; cursor: not-allowed !important; }
+    #sudoModal { position: fixed; inset: 0; background: rgba(1, 4, 9, 0.75); z-index: 2000;
+                 display: flex; align-items: center; justify-content: center; padding: 20px; }
+    #sudoModal[hidden], #sudoToast[hidden] { display: none; }
+    #sudoModal .card { background: #161b22; border: 1px solid #30363d; border-radius: 10px;
+                       padding: 20px; width: 100%; max-width: 340px; color: #c9d1d9; font-family: sans-serif; }
+    #sudoModal h3 { margin: 0 0 8px; color: #d29922; }
+    #sudoModal p { font-size: 13px; color: #8b949e; margin: 0 0 12px; }
+    #sudoPw { width: 100%; box-sizing: border-box; padding: 10px; font-size: 16px; background: #0d1117;
+              border: 1px solid #30363d; color: #c9d1d9; border-radius: 6px; }
+    #sudoErr { color: #f85149 !important; min-height: 16px; margin: 8px 0 !important; }
+    #sudoModal .row { display: flex; gap: 8px; }
+    #sudoModal .row button { flex: 1; margin: 0 !important; padding: 10px !important; }
+    #sudoSubmit { background: #238636 !important; color: #fff !important; font-weight: bold; }
+    #sudoToast { position: fixed; top: 64px; left: 10px; right: 10px; z-index: 1500; padding: 10px 14px;
+                 background: #161b22; border: 1px solid #d29922; color: #e3b341; border-radius: 8px;
+                 font-family: sans-serif; font-size: 13px; text-align: center; cursor: pointer; }
+</style>
+<div id="sudoBar" data-sudo-ui>
+    <span id="sudoStatus">🔒 Read-only</span>
+    <button id="sudoBtn" type="button">🔒 Sudo mode</button>
+</div>
+<div id="sudoToast" data-sudo-ui hidden></div>
+<div id="sudoModal" data-sudo-ui hidden>
+    <div class="card">
+        <h3>🔒 Sudo mode</h3>
+        <p id="sudoHint">Enter the password to edit. This device stays logged in for 30 days, or until you tap Log out.</p>
+        <input type="password" id="sudoPw" placeholder="Password" autocomplete="current-password">
+        <p id="sudoErr"></p>
+        <div class="row">
+            <button id="sudoSubmit" type="button">Unlock</button>
+            <button id="sudoCancel" type="button">Cancel</button>
+        </div>
+    </div>
+</div>
+<script>
+    (function () {
+        var ADMIN = __ADMIN__;
+        var $ = function (id) { return document.getElementById(id); };
+        var btn = $('sudoBtn'), statusEl = $('sudoStatus'), modal = $('sudoModal');
+        var pw = $('sudoPw'), err = $('sudoErr'), submit = $('sudoSubmit'), toast = $('sudoToast');
+
+        function showToast(msg) {
+            toast.textContent = msg;
+            toast.hidden = false;
+            setTimeout(function () { toast.hidden = true; }, 9000);
+        }
+        toast.addEventListener('click', function () { toast.hidden = true; });
+
+        try {
+            var pending = sessionStorage.getItem('sudoMsg');
+            if (pending) { sessionStorage.removeItem('sudoMsg'); showToast(pending); }
+        } catch (e) {}
+
+        function openLogin() {
+            err.textContent = '';
+            pw.value = '';
+            modal.hidden = false;
+            setTimeout(function () { pw.focus(); }, 50);
+        }
+        function closeLogin() { modal.hidden = true; }
+
+        function doLogin() {
+            if (!pw.value) return;
+            submit.disabled = true;
+            fetch('/api/auth/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ password: pw.value })
+            })
+            .then(function (r) { return r.json().then(function (d) { return { s: r.status, d: d }; }); })
+            .then(function (x) {
+                if (x.s === 200) { location.reload(); return; }
+                err.textContent = (x.d && x.d.message) || 'Login failed.';
+                submit.disabled = false;
+                pw.select();
+            })
+            .catch(function () { err.textContent = 'Network error. Try again.'; submit.disabled = false; });
+        }
+
+        function doLogout() {
+            fetch('/api/auth/logout', { method: 'POST' })
+                .catch(function () {})
+                .then(function () {
+                    try {
+                        sessionStorage.setItem('sudoMsg',
+                            "Logged out. If you tap Sudo mode again, you'll need to enter the password again.");
+                    } catch (e) {}
+                    location.reload();
+                });
+        }
+
+        if (ADMIN) {
+            btn.textContent = '🔓 Log out';
+            btn.classList.add('on');
+            statusEl.textContent = '🔓 Sudo mode active';
+            statusEl.classList.add('on');
+            btn.addEventListener('click', doLogout);
+        } else {
+            // Read-only: lock every control except the sudo UI and the harmless Copy button.
+            document.querySelectorAll('button, input, textarea, select').forEach(function (el) {
+                if (el.closest('[data-sudo-ui]') || el.classList.contains('copy-btn')) return;
+                el.disabled = true;
+            });
+            btn.addEventListener('click', openLogin);
+        }
+
+        submit.addEventListener('click', doLogin);
+        $('sudoCancel').addEventListener('click', closeLogin);
+        modal.addEventListener('click', function (e) { if (e.target === modal) closeLogin(); });
+        pw.addEventListener('keydown', function (e) {
+            if (e.key === 'Enter') doLogin();
+            if (e.key === 'Escape') closeLogin();
+        });
+    })();
+</script>
+"""
+
 # --- Render Port Binding & HTTP Server ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
+    def _client_ip(self):
+        # Rightmost X-Forwarded-For entry is the one Render's proxy added (the leftmost can be spoofed).
+        forwarded = self.headers.get("X-Forwarded-For", "")
+        if forwarded:
+            return forwarded.split(",")[-1].strip()
+        return self.client_address[0]
+
+    def _is_admin(self):
+        raw_cookie = self.headers.get("Cookie", "")
+        if not raw_cookie:
+            return False
+        try:
+            morsel = SimpleCookie(raw_cookie).get(SUDO_COOKIE_NAME)
+        except Exception:
+            return False
+        return bool(morsel) and verify_sudo_token(morsel.value)
+
+    def _cookie_header(self, value, max_age):
+        parts = [f"{SUDO_COOKIE_NAME}={value}", f"Max-Age={max_age}", "Path=/", "HttpOnly", "SameSite=Strict"]
+        if self.headers.get("X-Forwarded-Proto", "").lower() == "https":
+            parts.append("Secure")
+        return "; ".join(parts)
+
+    def _send_json(self, status, payload, extra_headers=None):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        for name, value in (extra_headers or []):
+            self.send_header(name, value)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_login(self):
+        if not ADMIN_PASSWORD:
+            self._send_json(503, {"message": "Sudo mode isn't set up. Add the ADMIN_PASSWORD environment variable on Render."})
+            return
+        ip = self._client_ip()
+        wait = sudo_lockout_remaining(ip)
+        if wait:
+            self._send_json(429, {"message": f"Too many wrong attempts. Try again in {math.ceil(wait / 60)} min."})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            data = json.loads(self.rfile.read(min(length, 4096)).decode("utf-8"))
+            supplied = str(data.get("password", "")).strip()
+        except Exception:
+            supplied = ""
+        if hmac.compare_digest(supplied.encode("utf-8"), ADMIN_PASSWORD.encode("utf-8")):
+            sudo_clear_failures(ip)
+            self._send_json(200, {"message": "Sudo mode on."},
+                            [("Set-Cookie", self._cookie_header(make_sudo_token(), SUDO_SESSION_SECONDS))])
+        else:
+            sudo_register_failure(ip)
+            print("🔒 Failed sudo login attempt", flush=True)   # stdout only: /logs is public, so no IPs there
+            self._send_json(401, {"message": "Wrong password."})
+
+    def _handle_logout(self):
+        self._send_json(200, {"message": "Logged out."}, [("Set-Cookie", self._cookie_header("", 0))])
+
+    def _inject_sudo(self, page_html):
+        snippet = SUDO_SNIPPET.replace("__ADMIN__", "true" if self._is_admin() else "false")
+        head, sep, tail = page_html.rpartition("</body>")
+        return (head + snippet + sep + tail) if sep else (page_html + snippet)
+
     def do_GET(self):
-        if self.path.split("?")[0] == "/api/logs":
+        route = self.path.split("?")[0]
+
+        # Default-deny: every POST/DELETE (except login/logout) needs a valid sudo cookie.
+        if self.command in ("POST", "DELETE") and route not in SUDO_AUTH_ROUTES and not self._is_admin():
+            self._send_json(401, {"message": "🔒 Sudo mode required. Tap 'Sudo mode' at the top right and enter the password."})
+            return
+
+        if route == "/api/auth/login" and self.command == "POST":
+            self._handle_login()
+
+        elif route == "/api/auth/logout" and self.command == "POST":
+            self._handle_logout()
+
+        elif route == "/api/logs":
             query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             try:
                 since_id = int(query.get("since", ["0"])[0])
@@ -879,6 +1168,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         elif self.path == "/live":
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
 
             streams = load_streams()
@@ -1119,6 +1409,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             </body>
             </html>
             """
+            html_content = self._inject_sudo(html_content)
             self.wfile.write(html_content.encode("utf-8"))
 
         elif self.path.split("?")[0] == "/api/leaderboard":
@@ -1151,6 +1442,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         elif self.path == "/moderation":
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
 
             config = load_moderation()
@@ -1355,6 +1647,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             </body>
             </html>
             """
+            html_content = self._inject_sudo(html_content)
             self.wfile.write(html_content.encode("utf-8"))
 
         elif self.path.startswith("/api/streams"):
