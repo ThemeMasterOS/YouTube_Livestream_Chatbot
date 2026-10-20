@@ -1009,6 +1009,54 @@ SUDO_SNIPPET = """
 </script>
 """
 
+
+# ---------------------------------------------------------------------------
+# Mobile support for /commands, /live, /moderation and /leaderboard.
+# add_mobile_support() adds the viewport tag (without it phones render the page
+# zoomed out) plus a small stylesheet that only applies on narrow screens.
+# ---------------------------------------------------------------------------
+MOBILE_META = '<meta name="viewport" content="width=device-width, initial-scale=1">'
+
+MOBILE_CSS = """
+<style>
+@media (max-width: 700px) {
+    body { padding: 12px !important; }
+    .container { max-width: 100% !important; }
+    h2 { font-size: 20px; }
+    .box, .add-box, .backup-box { padding: 14px !important; }
+
+    /* 16px inputs stop iOS from zooming in when you tap a field */
+    input, textarea, select { font-size: 16px !important; }
+    input[type="text"], textarea { width: 100% !important; box-sizing: border-box; }
+    .add-box input[type="text"] { margin-right: 0 !important; }
+    button { min-height: 40px; }
+    code { word-break: break-all; }
+
+    /* Normal tables: scroll sideways inside themselves, never the whole page */
+    table:not(.stack-table) { display: block; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    table:not(.stack-table) tbody { display: table; width: 100%; }
+    th, td { padding: 8px !important; font-size: 13px; word-break: break-word; }
+    td button { display: block; width: 100%; margin: 4px 0 !important; }
+
+    /* Card layout: each table row becomes a stacked card with labelled fields */
+    .stack-table, .stack-table tbody, .stack-table tr, .stack-table td { display: block; width: 100%; box-sizing: border-box; }
+    .stack-table tr:first-child { display: none; }
+    .stack-table tr { background: #0d1117; border: 1px solid #30363d; border-radius: 8px; padding: 10px; margin-bottom: 12px; }
+    .stack-table td { border-bottom: none; padding: 6px 0 !important; }
+    .stack-table td[data-label]::before { content: attr(data-label); display: block; color: #8b949e; font-size: 12px; margin-bottom: 4px; }
+    .stack-table td[data-label=""]::before { display: none; }
+    .stack-table input[type="number"] { width: 100% !important; box-sizing: border-box; }
+    .stack-table input.mod-duration { width: calc(100% - 40px) !important; }
+}
+</style>
+"""
+
+
+def add_mobile_support(page_html):
+    if 'name="viewport"' not in page_html:
+        page_html = page_html.replace("<head>", "<head>" + MOBILE_META, 1)
+    return page_html.replace("</head>", MOBILE_CSS + "</head>", 1)
+
 # --- Render Port Binding & HTTP Server ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def _client_ip(self):
@@ -1073,6 +1121,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self._send_json(200, {"message": "Logged out."}, [("Set-Cookie", self._cookie_header("", 0))])
 
     def _inject_sudo(self, page_html):
+        page_html = add_mobile_support(page_html)
         snippet = SUDO_SNIPPET.replace("__ADMIN__", "true" if self._is_admin() else "false")
         head, sep, tail = page_html.rpartition("</body>")
         return (head + snippet + sep + tail) if sep else (page_html + snippet)
@@ -1163,6 +1212,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             </body>
             </html>
             """
+            html_content = add_mobile_support(html_content)
             self.wfile.write(html_content.encode("utf-8"))
 
         elif self.path == "/live":
@@ -1432,6 +1482,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                     .replace("__ROWS__", rows_html)
                     .replace("__COUNT__", f"Top {len(rows)}")
                     .replace("__START__", str(DEFAULT_STARTING_COINS)))
+            page = add_mobile_support(page)
             body = page.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1461,13 +1512,13 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                 checked = "checked" if settings.get("enabled") else ""
                 stream_rows += f"""
                 <tr>
-                    <td>{label}<br><code style="font-size:11px;color:#8b949e;">{video_id}</code></td>
-                    <td><input type="checkbox" class="mod-enabled" data-video-id="{video_id}" {checked}></td>
-                    <td><input type="number" class="mod-threshold" data-video-id="{video_id}" value="{settings.get('spam_threshold', DEFAULT_SPAM_THRESHOLD)}" min="1" style="width:60px;"></td>
-                    <td><input type="number" class="mod-duration" data-video-id="{video_id}" value="{settings.get('timeout_seconds', DEFAULT_TIMEOUT_SECONDS)}" min="1" style="width:80px;"> sec</td>
-                    <td><textarea class="mod-timeout-msg" data-video-id="{video_id}" style="min-height:40px;">{settings.get('timeout_message', DEFAULT_TIMEOUT_MESSAGE)}</textarea></td>
-                    <td><textarea class="mod-reminder-msg" data-video-id="{video_id}" style="min-height:40px;">{settings.get('reminder_message', DEFAULT_REMINDER_MESSAGE)}</textarea></td>
-                    <td><button class="save-btn" onclick="saveStreamSettings('{video_id}')">Save</button></td>
+                    <td data-label="Stream">{label}<br><code style="font-size:11px;color:#8b949e;">{video_id}</code></td>
+                    <td data-label="Enabled"><input type="checkbox" class="mod-enabled" data-video-id="{video_id}" {checked}></td>
+                    <td data-label="Spam threshold (repeats in a row)"><input type="number" class="mod-threshold" data-video-id="{video_id}" value="{settings.get('spam_threshold', DEFAULT_SPAM_THRESHOLD)}" min="1" style="width:60px;"></td>
+                    <td data-label="Timeout duration"><input type="number" class="mod-duration" data-video-id="{video_id}" value="{settings.get('timeout_seconds', DEFAULT_TIMEOUT_SECONDS)}" min="1" style="width:80px;"> sec</td>
+                    <td data-label="Timeout message"><textarea class="mod-timeout-msg" data-video-id="{video_id}" style="min-height:40px;">{settings.get('timeout_message', DEFAULT_TIMEOUT_MESSAGE)}</textarea></td>
+                    <td data-label="Reminder message"><textarea class="mod-reminder-msg" data-video-id="{video_id}" style="min-height:40px;">{settings.get('reminder_message', DEFAULT_REMINDER_MESSAGE)}</textarea></td>
+                    <td data-label=""><button class="save-btn" onclick="saveStreamSettings('{video_id}')">Save</button></td>
                 </tr>
                 """
 
@@ -1552,7 +1603,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                     <div class="box">
                         <h3>📺 Per-Stream Spam Overrides</h3>
                         <p class="note">Only currently-listening (🟢) streams are shown. A per-stream override, when enabled, takes priority over "All Streams" for that stream's spam detection.</p>
-                        <table>
+                        <table class="stack-table">
                             <tr>
                                 <th>Stream</th>
                                 <th>Enabled</th>
