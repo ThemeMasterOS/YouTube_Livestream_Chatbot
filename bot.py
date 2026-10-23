@@ -62,8 +62,25 @@ def safe_pytchat_create(video_id):
 # Names are matched via the exception's MRO (by name, not import), so a
 # pytchat version that lacks one of them can't break the bot. The labels
 # are hints for the log only; they never change what the bot does.
-_PYTCHAT_ENDED_NAMES = {"ChatDataFinished", "FailedExtractContinuation"}
-_PYTCHAT_NETWORK_NAMES = {"RetryExceedMaxCount", "UnknownConnectionError"}
+# NoContents ("Chat data stream is empty") is what pytchat raises once a stream's
+# chat has gone empty/offline, so it is treated like ChatDataFinished.
+_PYTCHAT_ENDED_NAMES = {"ChatDataFinished", "FailedExtractContinuation", "NoContents"}
+_PYTCHAT_NETWORK_NAMES = {
+    "RetryExceedMaxCount", "UnknownConnectionError",
+    # httpx / stdlib network errors (e.g. ReadError "[Errno 11] Resource
+    # temporarily unavailable", RemoteProtocolError "ConnectionTerminated")
+    "ReadError", "WriteError", "ConnectError", "RemoteProtocolError",
+    "ReadTimeout", "WriteTimeout", "ConnectTimeout", "PoolTimeout",
+    "NetworkError", "TransportError", "TimeoutException",
+    "ConnectionError", "TimeoutError",
+}
+
+# Restore-loop guard: if a freshly restored pytchat dies again within this many
+# seconds, it counts as a "rapid death". After PYTCHAT_MAX_RAPID_DEATHS in a row
+# the bot stops restoring and lets the YouTube API decide (or stops the listener
+# when no backup API exists).
+PYTCHAT_RAPID_DEATH_WINDOW = 30
+PYTCHAT_MAX_RAPID_DEATHS = 3
 _PYTCHAT_UNAVAILABLE_NAMES = {"InvalidVideoIdException", "VideoInfoParseError", "PatternUnmatchError"}
 
 
@@ -3069,6 +3086,8 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
     chat = None
 
     last_pytchat_retry = 0
+    chat_started_at = time.time()   # when the current pytchat object was created
+    rapid_pytchat_deaths = 0        # consecutive deaths shortly after a restore
     PYTCHAT_RETRY_INTERVAL = 600
 
     # Stream-end detection: count consecutive API failures
@@ -3079,6 +3098,7 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
     add_log(f"Connecting pytchat listener for '{stream_name}' (0 quota cost)...")
     try:
         chat = safe_pytchat_create(stream_id)
+        chat_started_at = time.time()
         if not chat.is_alive():
             raise Exception(f"Pytchat stream initialization failed ({describe_pytchat_stop(chat)}).")
         add_log(f"Listening to '{stream_name}' via pytchat...")
@@ -3111,6 +3131,7 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
                     test_chat = safe_pytchat_create(stream_id)
                     if test_chat.is_alive():
                         chat = test_chat
+                        chat_started_at = time.time()
                         use_api_fallback = False
                         next_page_token = None
                         add_log(f"Pytchat restored for '{stream_name}'!")
@@ -3123,7 +3144,15 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
                 if not chat or not chat.is_alive():
                     # 1) Log WHY the old chat stopped before it gets replaced
                     stop_reason = describe_pytchat_stop(chat)
+
+                    # Rapid-death counter: did this chat die right after being (re)created?
+                    if time.time() - chat_started_at < PYTCHAT_RAPID_DEATH_WINDOW:
+                        rapid_pytchat_deaths += 1
+                    else:
+                        rapid_pytchat_deaths = 0  # it lived a while, so this is an isolated death
+
                     if active_youtube_backup is not None and pytchat_stop_means_ended(chat):
+                        rapid_pytchat_deaths = 0
                         # Pytchat itself says the chat data finished. Skip the (likely
                         # futile) restore and let the YouTube API give the final verdict:
                         # liveChatEnded/Disabled/NotFound stops the listener, while a
@@ -3134,6 +3163,20 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
                         next_page_token = None
                         last_pytchat_retry = time.time()
                         continue
+
+                    # Restore-loop guard: stop restoring a chat that keeps dying instantly
+                    if rapid_pytchat_deaths >= PYTCHAT_MAX_RAPID_DEATHS:
+                        add_log(f"Pytchat keeps dying right after restore ({rapid_pytchat_deaths}x in a row) for '{stream_name}': {stop_reason}.")
+                        rapid_pytchat_deaths = 0
+                        if active_youtube_backup is None:
+                            add_log(f"🔴 Stream '{stream_name}' ({stream_id}) — no backup API configured to verify. Stopping listener.")
+                            break  # Exit the while loop (cleanup below marks it stopped)
+                        add_log(f"Verifying '{stream_name}' with the YouTube API before deciding...")
+                        use_api_fallback = True
+                        next_page_token = None
+                        last_pytchat_retry = time.time()
+                        continue
+
                     add_log(f"Pytchat stopped for '{stream_name}': {stop_reason}. Attempting to restore pytchat...")
                     restore_error = None
                     # 2) One restore attempt
@@ -3141,6 +3184,7 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
                         test_chat = safe_pytchat_create(stream_id)
                         if test_chat.is_alive():
                             chat = test_chat
+                            chat_started_at = time.time()
                             use_api_fallback = False
                             next_page_token = None
                             add_log(f"Pytchat restored for '{stream_name}'!")
@@ -3227,6 +3271,7 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
                         test_chat = safe_pytchat_create(stream_id)
                         if test_chat.is_alive():
                             chat = test_chat
+                            chat_started_at = time.time()
                             use_api_fallback = False
                             next_page_token = None
                             add_log(f"Pytchat restored for '{stream_name}'! Resuming without waiting for quota reset.")
@@ -3272,6 +3317,7 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
                 test_chat = safe_pytchat_create(stream_id)
                 if test_chat.is_alive():
                     chat = test_chat
+                    chat_started_at = time.time()
                     use_api_fallback = False
                     next_page_token = None
                     add_log(f"Pytchat restored for '{stream_name}' after chat loop error!")
