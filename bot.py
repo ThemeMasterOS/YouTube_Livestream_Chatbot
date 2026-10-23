@@ -55,6 +55,80 @@ def safe_pytchat_create(video_id):
     finally:
         signal.signal = original_signal
 
+
+# --- pytchat stop-reason helper ---------------------------------------
+# is_alive() only says "stopped", not why. raise_for_status() re-raises the
+# stored exception, so we use it to explain every is_alive() == False.
+# Names are matched via the exception's MRO (by name, not import), so a
+# pytchat version that lacks one of them can't break the bot. The labels
+# are hints for the log only; they never change what the bot does.
+_PYTCHAT_ENDED_NAMES = {"ChatDataFinished", "FailedExtractContinuation"}
+_PYTCHAT_NETWORK_NAMES = {"RetryExceedMaxCount", "UnknownConnectionError"}
+_PYTCHAT_UNAVAILABLE_NAMES = {"InvalidVideoIdException", "VideoInfoParseError", "PatternUnmatchError"}
+
+
+def _classify_pytchat_exception(exc):
+    names = {cls.__name__ for cls in type(exc).__mro__}
+    if names & _PYTCHAT_ENDED_NAMES:
+        return "stream likely ended"
+    if names & _PYTCHAT_NETWORK_NAMES:
+        return "network problem"
+    if names & _PYTCHAT_UNAVAILABLE_NAMES:
+        return "video unavailable, not live, or lookup failed"
+    return "other"
+
+
+def describe_pytchat_stop(chat):
+    """Return a readable reason for why a pytchat chat object is not alive."""
+    if chat is None:
+        return "no pytchat object exists"
+    try:
+        chat.raise_for_status()
+    except Exception as e:
+        return f"{_classify_pytchat_exception(e)} - {type(e).__name__}: {e}"
+    return "no error reported"
+
+
+def pytchat_stop_means_ended(chat):
+    """True if pytchat's stored exception says the chat data finished.
+    Only a hint: the YouTube API gets the final say before a listener stops."""
+    if chat is None:
+        return False
+    try:
+        chat.raise_for_status()
+    except Exception as e:
+        return bool({cls.__name__ for cls in type(e).__mro__} & _PYTCHAT_ENDED_NAMES)
+    return False
+
+
+# --- YouTube API "chat is gone" reasons -------------------------------
+# (HTTP status, API error reason) -> text for the log. Any of these means the
+# live chat cannot be read, so the listener stops immediately (no 3-strike wait).
+_CHAT_GONE_REASONS = {
+    (403, "liveChatEnded"): "YouTube reports the live chat has ended (liveChatEnded)",
+    (403, "liveChatDisabled"): "the live chat is disabled (liveChatDisabled)",
+    (404, "liveChatNotFound"): "the live chat no longer exists (liveChatNotFound)",
+}
+
+
+def _http_error_has_reason(e, reason):
+    """Check Google's structured error details first, then fall back to the text."""
+    details = getattr(e, "error_details", None)
+    if isinstance(details, list):
+        for d in details:
+            if isinstance(d, dict) and d.get("reason") == reason:
+                return True
+    return reason in str(e)
+
+
+def chat_gone_description(e):
+    """Return a log description if this HttpError means the chat is gone, else None."""
+    status = getattr(getattr(e, "resp", None), "status", None)
+    for (code, reason), description in _CHAT_GONE_REASONS.items():
+        if status == code and _http_error_has_reason(e, reason):
+            return description
+    return None
+
 # --- Global Log Storage (Holds last 100 entries) ---
 chat_logs = deque(maxlen=100)   # holds (id, text) tuples
 _log_lock = threading.Lock()
@@ -3006,7 +3080,7 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
     try:
         chat = safe_pytchat_create(stream_id)
         if not chat.is_alive():
-            raise Exception("Pytchat stream initialization failed.")
+            raise Exception(f"Pytchat stream initialization failed ({describe_pytchat_stop(chat)}).")
         add_log(f"Listening to '{stream_name}' via pytchat...")
     except Exception as e:
         if active_youtube_backup is None:
@@ -3041,29 +3115,51 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
                         next_page_token = None
                         add_log(f"Pytchat restored for '{stream_name}'!")
                         continue
+                    add_log(f"Pytchat restore failed for '{stream_name}': replacement chat not alive ({describe_pytchat_stop(test_chat)})")
                 except Exception as e:
                     add_log(f"Pytchat restore failed for '{stream_name}': {e}")
 
             if not use_api_fallback:
                 if not chat or not chat.is_alive():
+                    # 1) Log WHY the old chat stopped before it gets replaced
+                    stop_reason = describe_pytchat_stop(chat)
+                    if active_youtube_backup is not None and pytchat_stop_means_ended(chat):
+                        # Pytchat itself says the chat data finished. Skip the (likely
+                        # futile) restore and let the YouTube API give the final verdict:
+                        # liveChatEnded/Disabled/NotFound stops the listener, while a
+                        # normal API response means pytchat was wrong and the periodic
+                        # pytchat retry will bring it back later.
+                        add_log(f"Pytchat stopped for '{stream_name}': {stop_reason}. Verifying with the YouTube API before deciding...")
+                        use_api_fallback = True
+                        next_page_token = None
+                        last_pytchat_retry = time.time()
+                        continue
+                    add_log(f"Pytchat stopped for '{stream_name}': {stop_reason}. Attempting to restore pytchat...")
+                    restore_error = None
+                    # 2) One restore attempt
                     try:
                         test_chat = safe_pytchat_create(stream_id)
                         if test_chat.is_alive():
                             chat = test_chat
                             use_api_fallback = False
                             next_page_token = None
+                            add_log(f"Pytchat restored for '{stream_name}'!")
                             continue
+                        restore_error = f"replacement chat not alive ({describe_pytchat_stop(test_chat)})"
                     except Exception as theme_master:
-                        if active_youtube_backup is None:
-                            add_log(f"Pytchat failed for '{stream_name}': {theme_master} No backup API configured — stopping listener.")
-                            with active_streams_lock:
-                                active_stream_ids.discard(stream_id)
-                            return
-                        add_log(f"Pytchat restore failed for '{stream_name}': {theme_master} Switching to API fallback...")
-                        use_api_fallback = True
-                        next_page_token = None
-                        last_pytchat_retry = time.time()
-                        continue  # Route to the API-fallback branch next pass, not the dead pytchat object below
+                        restore_error = str(theme_master)
+
+                    # 3) Restore failed (exception OR not alive) -> fallback mode
+                    if active_youtube_backup is None:
+                        add_log(f"Pytchat failed for '{stream_name}': {restore_error}. No backup API configured — stopping listener.")
+                        with active_streams_lock:
+                            active_stream_ids.discard(stream_id)
+                        return
+                    add_log(f"Pytchat restore failed for '{stream_name}': {restore_error}. Switching to API fallback...")
+                    use_api_fallback = True
+                    next_page_token = None
+                    last_pytchat_retry = time.time()
+                    continue  # Route to the API-fallback branch next pass, not the dead pytchat object below
 
                 for msg_item in chat.get().sync_items():
                     userName = msg_item.author.name
@@ -3117,6 +3213,7 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
                 time.sleep(max(polling_millis / 1000.0, 10.0))
 
         except HttpError as e:
+            gone_reason = chat_gone_description(e)
             if e.resp.status == 403 and "quotaExceeded" in str(e):
                 if active_youtube_backup is youtube_backup1 and youtube_backup2 is not None:
                     add_log(f"Backup 1 quota exceeded for '{stream_name}'. Switching to Backup 2...")
@@ -3136,7 +3233,7 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
                             consecutive_api_failures = 0
                             continue
                         else:
-                            raise Exception("Pytchat stream initialization failed.")
+                            raise Exception(f"Pytchat stream initialization failed ({describe_pytchat_stop(test_chat)}).")
                     except Exception as pytchat_error:
                         wait_seconds, utc_offset_label = seconds_until_next_midnight_pt()
                         add_log(f"Pytchat restore failed for '{stream_name}': {pytchat_error}. Pausing until 00:00 PT ({utc_offset_label} UTC).")
@@ -3147,8 +3244,12 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
                         last_pytchat_retry = time.time()
                         add_log(f"Quota reset time reached for '{stream_name}'. Retrying pytchat first...")
                 consecutive_api_failures = 0  # Quota errors don't mean the stream ended
+            elif gone_reason:
+                # YouTube explicitly says the chat is gone -> no need for 3 strikes
+                add_log(f"🔴 Stream '{stream_name}' ({stream_id}) — {gone_reason}. Stopping listener.")
+                break  # Exit the while loop
             elif e.resp.status == 404:
-                # 404 = live chat no longer exists → stream ended
+                # Any other 404 → stream may have ended (3-strike check)
                 consecutive_api_failures += 1
                 add_log(f"YouTube API 404 for '{stream_name}' (attempt {consecutive_api_failures}/{MAX_CONSECUTIVE_FAILURES}) — stream may have ended.")
                 if consecutive_api_failures >= MAX_CONSECUTIVE_FAILURES:
@@ -3176,7 +3277,7 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
                     add_log(f"Pytchat restored for '{stream_name}' after chat loop error!")
                     continue
                 else:
-                    raise Exception("Pytchat stream initialization failed.")
+                    raise Exception(f"Pytchat stream initialization failed ({describe_pytchat_stop(test_chat)}).")
             except Exception as restore_error:
                 add_log(f"Pytchat restore failed after chat loop error for '{stream_name}': {restore_error}. Switching to API Fallback...")
                 use_api_fallback = True
