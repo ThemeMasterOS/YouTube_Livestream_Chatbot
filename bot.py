@@ -2039,9 +2039,13 @@ credentials_backup2 = Authorize('backup2_client_secret.json', 'backup2_token.jso
 youtube_backup2 = build('youtube', 'v3', credentials=credentials_backup2) if credentials_backup2 else None
 
 if not youtube_backup1 and not youtube_backup2:
-    add_log("No backup credentials configured. Running with pytchat only (no API fallback).")
+    add_log("No backup credentials configured. API fallback will use the Main project (shares quota with replies).")
 elif not youtube_backup2:
-    add_log("Backup 2 not configured. Only Backup 1 is available as API fallback.")
+    add_log("Backup 2 not configured. API fallback order: Backup 1 -> Main (last resort).")
+elif not youtube_backup1:
+    add_log("Backup 1 not configured. API fallback order: Backup 2 -> Main (last resort).")
+else:
+    add_log("API fallback order: Backup 1 -> Backup 2 -> Main (last resort).")
 
 
 # --- Quota failover: Main -> Backup 1 -> Backup 2 -> wait for 00:00 PT ---
@@ -2115,6 +2119,48 @@ def call_with_quota_failover(make_request, purpose="API call"):
 
     wait_seconds, utc_offset_label = seconds_until_next_midnight_pt()
     raise AllQuotasExhausted(wait_seconds, utc_offset_label)
+
+
+# --- API fallback reader chain: Backup 1 -> Backup 2 -> Main (last resort) ---
+# Uses the same shared _quota_exhausted_until table as call_with_quota_failover,
+# so a client one listener finds exhausted is skipped by every other listener
+# AND by the reply-sending path. Main is always available (it is required at
+# startup), so API fallback works even when no backup project is configured.
+def reader_chain():
+    return [c for c in (youtube_backup1, youtube_backup2, youtube_main) if c is not None]
+
+
+def _client_name(client):
+    for name, c in _api_clients:
+        if c is client:
+            return name
+    return "API"
+
+
+def _quota_is_exhausted(name):
+    with _quota_lock:
+        reset_at = _quota_exhausted_until.get(name)
+        if reset_at is not None and datetime.now(_PT_ZONE) >= reset_at:
+            del _quota_exhausted_until[name]
+            add_log(f"Quota reset reached — {name} API is available again.")
+            return False
+        return reset_at is not None
+
+
+def _mark_quota_exhausted(name):
+    """Mark a client exhausted until 00:00 PT. Returns True if newly marked."""
+    with _quota_lock:
+        newly_marked = name not in _quota_exhausted_until
+        _quota_exhausted_until[name] = _next_midnight_pt()
+    return newly_marked
+
+
+def pick_reader():
+    """First client in the reader chain that still has quota, or None if all are exhausted."""
+    for client in reader_chain():
+        if not _quota_is_exhausted(_client_name(client)):
+            return client
+    return None
 
 
 def getLiveChatId(LIVE_STREAM_ID):
@@ -3016,8 +3062,11 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
     """
     _clear_pytchat_retry_request(stream_id)  # a brand-new listener tries pytchat first anyway
 
-    # Pick whichever backup client is actually configured; None if neither is.
-    active_youtube_backup = youtube_backup1 or youtube_backup2
+    # API fallback reader: Backup 1 -> Backup 2 -> Main (last resort). Never None,
+    # because Main is always configured. default_youtube_reader is where we
+    # return to after the 00:00 PT quota reset.
+    default_youtube_reader = reader_chain()[0]
+    active_youtube_backup = pick_reader() or default_youtube_reader
 
     if stop_flag.is_set():
         add_log(f"'{stream_name}' ({stream_id}) stopped before chat became available.")
@@ -3088,7 +3137,7 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
     last_pytchat_retry = 0
     chat_started_at = time.time()   # when the current pytchat object was created
     rapid_pytchat_deaths = 0        # consecutive deaths shortly after a restore
-    PYTCHAT_RETRY_INTERVAL = 120
+    PYTCHAT_RETRY_INTERVAL = 600
 
     # Stream-end detection: count consecutive API failures
     # If we get 3+ in a row, the stream has likely ended
@@ -3259,12 +3308,16 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
         except HttpError as e:
             gone_reason = chat_gone_description(e)
             if e.resp.status == 403 and "quotaExceeded" in str(e):
-                if active_youtube_backup is youtube_backup1 and youtube_backup2 is not None:
-                    add_log(f"Backup 1 quota exceeded for '{stream_name}'. Switching to Backup 2...")
-                    active_youtube_backup = youtube_backup2
+                exhausted_name = _client_name(active_youtube_backup)
+                if _mark_quota_exhausted(exhausted_name):
+                    add_log(f"{exhausted_name} quota exceeded for '{stream_name}'.")
+                next_reader = pick_reader()
+                if next_reader is not None:
+                    add_log(f"Switching '{stream_name}' to {_client_name(next_reader)} for API fallback...")
+                    active_youtube_backup = next_reader
                     next_page_token = None
                 else:
-                    add_log(f"Backup 2 quota exceeded for '{stream_name}'. Pausing 15 seconds before restoring pytchat one last time...")
+                    add_log(f"All API clients are out of quota for '{stream_name}'. Pausing 15 seconds before restoring pytchat one last time...")
                     time.sleep(15)
 
                     try:
@@ -3283,7 +3336,7 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
                         wait_seconds, utc_offset_label = seconds_until_next_midnight_pt()
                         add_log(f"Pytchat restore failed for '{stream_name}': {pytchat_error}. Pausing until 00:00 PT ({utc_offset_label} UTC).")
                         time.sleep(wait_seconds)
-                        active_youtube_backup = youtube_backup1
+                        active_youtube_backup = pick_reader() or default_youtube_reader
                         next_page_token = None
                         use_api_fallback = False  # Try pytchat first on resume
                         last_pytchat_retry = time.time()
