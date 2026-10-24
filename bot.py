@@ -3137,7 +3137,7 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
     last_pytchat_retry = 0
     chat_started_at = time.time()   # when the current pytchat object was created
     rapid_pytchat_deaths = 0        # consecutive deaths shortly after a restore
-    PYTCHAT_RETRY_INTERVAL = 600
+    PYTCHAT_RETRY_INTERVAL = 120
 
     # Stream-end detection: count consecutive API failures
     # If we get 3+ in a row, the stream has likely ended
