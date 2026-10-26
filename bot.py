@@ -154,6 +154,9 @@ _log_counter = 0                # monotonically increasing log ID
 # --- Live Streams Storage ---
 STREAMS_FILE = "streams_config.json"
 
+# --- Saved Channels Storage (v0.2.7) ---
+CHANNELS_FILE = "channels_config.json"
+
 # --- NeilCoins Storage ---
 COINS_FILE = "coins_config.json"
 DEFAULT_STARTING_COINS = 100
@@ -306,6 +309,190 @@ def load_streams():
 
 def save_streams(streams):
     save_json_with_backup(STREAMS_FILE, streams, f"{len(streams)} stream(s)")
+
+
+# --- Saved Channels (v0.2.7) ---
+# A reusable list behind the "Select Channel" dropdown on /live, kept in
+# channels_config.json (GitHub-backed like the other config files):
+#   {"imported_stream_channels": true,
+#    "channels": {"UCxxxxxxxxxxxxxxxxxxxxxx": {"name": "...", "handle": "@..."}}}
+# Each stream keeps its OWN copy of channel_id in streams_config.json, so
+# editing or deleting a saved channel can never break a running stream.
+# The list is cached in memory (loaded once) and written through on every change.
+_channels_lock = threading.RLock()
+_channels_state = None
+
+
+def _short_channel_id(channel_id):
+    return f"{channel_id[:6]}…{channel_id[-6:]}" if len(channel_id) > 14 else channel_id
+
+
+def channel_display_name(channel_id, entry=None):
+    """Name if set, else the handle, else a shortened channel ID."""
+    entry = entry or {}
+    return entry.get("name") or entry.get("handle") or _short_channel_id(channel_id)
+
+
+def _channels_state_locked():
+    """The cached saved-channel state. Caller must hold _channels_lock."""
+    global _channels_state
+    if _channels_state is None:
+        raw = load_json_with_fallback(CHANNELS_FILE, "channel config section(s)")
+        if not isinstance(raw, dict):
+            raw = {}
+        clean = {}
+        stored = raw.get("channels")
+        for cid, entry in (stored.items() if isinstance(stored, dict) else []):
+            if pytchat_oembed_patch.is_valid_channel_id(cid) and isinstance(entry, dict):
+                clean[cid] = {
+                    "name": str(entry.get("name") or ""),
+                    "handle": str(entry.get("handle") or ""),
+                }
+        _channels_state = {
+            "imported_stream_channels": bool(raw.get("imported_stream_channels")),
+            "channels": clean,
+        }
+        add_log(f"Saved channel list ready: {len(clean)} channel(s).")
+    return _channels_state
+
+
+def _persist_channels_locked():
+    state = _channels_state
+    save_json_with_backup(CHANNELS_FILE, state, f"{len(state['channels'])} saved channel(s)")
+
+
+def list_saved_channels():
+    """Saved channels as a list of {id, name, handle}, sorted by display name."""
+    with _channels_lock:
+        channels = _channels_state_locked()["channels"]
+        items = [{"id": cid, "name": e["name"], "handle": e["handle"]} for cid, e in channels.items()]
+    items.sort(key=lambda c: channel_display_name(c["id"], c).lower())
+    return items
+
+
+def get_saved_channel(channel_id):
+    with _channels_lock:
+        entry = _channels_state_locked()["channels"].get(channel_id)
+        return {"id": channel_id, "name": entry["name"], "handle": entry["handle"]} if entry else None
+
+
+def upsert_saved_channel(channel_id, name, handle, replace_id=None):
+    """Add or update a channel. If replace_id differs from channel_id (an edit that
+    changed the ID), the old entry is removed so the channel is re-keyed."""
+    with _channels_lock:
+        channels = _channels_state_locked()["channels"]
+        if replace_id and replace_id != channel_id:
+            channels.pop(replace_id, None)
+        channels[channel_id] = {"name": name, "handle": handle}
+        _persist_channels_locked()
+
+
+def delete_saved_channel(channel_id):
+    with _channels_lock:
+        channels = _channels_state_locked()["channels"]
+        if channel_id not in channels:
+            return False
+        del channels[channel_id]
+        _persist_channels_locked()
+        return True
+
+
+def ensure_channel_saved(channel_id):
+    """Make sure a channel ID that was just put on a stream is in the saved list
+    (as an unnamed entry if it wasn't). Returns True if it was added."""
+    if not pytchat_oembed_patch.is_valid_channel_id(channel_id):
+        return False
+    with _channels_lock:
+        channels = _channels_state_locked()["channels"]
+        if channel_id in channels:
+            return False
+        channels[channel_id] = {"name": "", "handle": ""}
+        _persist_channels_locked()
+        return True
+
+
+def import_stream_channels_once(streams):
+    """
+    One-time import for people upgrading from v0.2.6: channel IDs already saved
+    on streams are added to the list as unnamed entries. Runs only while the
+    flag is unset AND the list is empty, and only writes when it actually adds
+    something, so a failed/blank load can never overwrite a real list.
+    """
+    with _channels_lock:
+        state = _channels_state_locked()
+        if state["imported_stream_channels"] or state["channels"]:
+            return 0
+        added = 0
+        for data in (streams or {}).values():
+            cid = data.get("channel_id") if isinstance(data, dict) else None
+            if cid and pytchat_oembed_patch.is_valid_channel_id(cid) and cid not in state["channels"]:
+                state["channels"][cid] = {"name": "", "handle": ""}
+                added += 1
+        if added:
+            state["imported_stream_channels"] = True
+            _persist_channels_locked()
+        return added
+
+
+def lookup_handle_via_api(handle):
+    """
+    YouTube Data API fallback for @handle lookups (channels.list?forHandle=,
+    about 1 quota unit), run through the usual Main -> Backup 1 -> Backup 2
+    quota failover. Returns {"channel_id", "name"} or None.
+    """
+    handle = "@" + handle.lstrip("@")
+    try:
+        resp = call_with_quota_failover(
+            lambda client: client.channels().list(part="id,snippet", forHandle=handle).execute(),
+            "channel handle lookup",
+        )
+    except AllQuotasExhausted:
+        add_log(f"Handle lookup for {handle} skipped: all API quotas are exhausted.")
+        return None
+    except TypeError as e:
+        add_log(f"Handle lookup for {handle} via API failed: the installed google-api-python-client doesn't support forHandle (upgrade it). {e}")
+        return None
+    except Exception as e:
+        add_log(f"Handle lookup for {handle} via API failed: {e}")
+        return None
+
+    items = resp.get("items") or []
+    if not items:
+        return None
+    channel_id = items[0].get("id", "")
+    if not pytchat_oembed_patch.is_valid_channel_id(channel_id):
+        return None
+    return {"channel_id": channel_id, "name": (items[0].get("snippet") or {}).get("title", "")}
+
+
+def resolve_channel_input(text):
+    """
+    Turn whatever was typed in the Add Channel dialog into a channel.
+    Returns ({"channel_id", "handle", "name"}, None) on success or
+    (None, error_message). Order for a handle: /about page scrape (free),
+    then the YouTube Data API, then ask for the UC... ID.
+    """
+    kind, value = pytchat_oembed_patch.parse_channel_input(text)
+
+    if kind == "id":
+        return {"channel_id": value, "handle": "", "name": ""}, None
+
+    if kind == "handle":
+        found = pytchat_oembed_patch.resolve_handle_to_channel_id(value)
+        if not found:
+            add_log(f"Page lookup for {value} found nothing — trying the YouTube API.")
+            found = lookup_handle_via_api(value)
+        if found:
+            return {"channel_id": found["channel_id"], "handle": value, "name": found.get("name", "")}, None
+        return None, (
+            f"Couldn't look up {value} from the server (YouTube may be blocking the lookup, or the handle doesn't exist). "
+            "Paste the channel's ID instead: it starts with UC and is 24 characters long."
+        )
+
+    return None, (
+        "Enter a handle like @name, a youtube.com/@name or /channel/UC... link, "
+        "or a channel ID (starts with UC, 24 characters)."
+    )
 
 
 # --- NeilCoins helpers ---
@@ -1148,6 +1335,418 @@ def add_mobile_support(page_html):
         page_html = page_html.replace("<head>", "<head>" + MOBILE_META, 1)
     return page_html.replace("</head>", MOBILE_CSS + "</head>", 1)
 
+
+# ---------------------------------------------------------------------------
+# v0.2.7: "Select Channel" dropdown + Add/Edit Channel dialog for /live.
+# Plain (non-f) strings so CSS/JS braces need no escaping; they are dropped
+# into the /live page with {CHANNEL_UI_CSS}, {CHANNEL_UI_HTML}, {CHANNEL_UI_JS}.
+# Saved channels reach the page as window.__SAVED_CHANNELS__.
+# ---------------------------------------------------------------------------
+CHANNEL_UI_CSS = r"""
+                    .picker-btn { display: inline-flex; align-items: center; justify-content: space-between; gap: 10px; min-width: 240px; max-width: 100%; box-sizing: border-box; text-align: left; padding: 8px 12px; margin: 0 8px 8px 0; background: #0d1117; color: #8b949e; border: 1px solid #30363d; border-radius: 4px; }
+                    .picker-btn:hover { background: #0d1117; border-color: #58a6ff; }
+                    .picker-btn.has-value { color: #58a6ff; border-color: #1f6feb; }
+                    .picker-btn .picker-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+                    .picker-btn .caret { font-size: 11px; color: #8b949e; }
+                    .chback[hidden], .chpanel[hidden], .chmodalback[hidden] { display: none !important; }
+                    .chback { position: fixed; inset: 0; z-index: 900; background: transparent; }
+                    .chpanel { position: fixed; z-index: 910; display: flex; flex-direction: column; background: #161b22; border: 1px solid #30363d; border-radius: 8px; box-shadow: 0 8px 24px rgba(1, 4, 9, 0.6); overflow: hidden; }
+                    .chlist { overflow-y: auto; flex: 1; padding: 4px 0; }
+                    .chrow { display: flex; align-items: center; gap: 8px; padding: 8px 8px 8px 12px; cursor: pointer; border-left: 3px solid transparent; }
+                    .chrow:hover { background: #21262d; }
+                    .chrow:focus { outline: none; background: #21262d; }
+                    .chrow:focus-visible { outline: 2px solid #58a6ff; outline-offset: -2px; }
+                    .chrow.sel { border-left-color: #58a6ff; background: #1c2128; }
+                    .chmain { flex: 1; min-width: 0; }
+                    .chname { display: block; color: #c9d1d9; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+                    .chrow.none .chname { color: #8b949e; font-style: italic; }
+                    .chsub { display: block; margin-top: 2px; font-size: 12px; color: #8b949e; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+                    .chedit { margin: 0; padding: 4px 10px; flex: none; }
+                    .chfoot { border-top: 1px solid #30363d; padding: 8px; }
+                    .chfoot button { width: 100%; margin: 0; }
+                    .chempty { padding: 10px 12px; font-size: 13px; color: #8b949e; }
+                    .chmodalback { position: fixed; inset: 0; z-index: 1000; display: flex; align-items: center; justify-content: center; padding: 16px; background: rgba(1, 4, 9, 0.72); }
+                    .chmodal { width: 100%; max-width: 440px; max-height: 100%; overflow-y: auto; box-sizing: border-box; background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 20px; }
+                    .chmodal h3 { margin: 0 0 6px 0; color: #58a6ff; }
+                    .chmodal label { display: block; margin: 14px 0 4px 0; font-size: 14px; color: #c9d1d9; }
+                    .chmodal .chhint { font-size: 12px; color: #8b949e; }
+                    .chmodal input { width: 100%; box-sizing: border-box; padding: 8px; background: #0d1117; border: 1px solid #30363d; color: #c9d1d9; border-radius: 4px; }
+                    .chmodal .chhelp { margin: 10px 0 0 0; font-size: 12px; color: #8b949e; }
+                    .chmodal .chstatus { min-height: 18px; margin: 8px 0 0 0; font-size: 13px; color: #8b949e; }
+                    .chmodal .chstatus.err { color: #f85149; }
+                    .chactions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+                    .chactions button { margin: 0; }
+                    .chactions .chdanger { margin-left: auto; color: #f85149; border-color: #6e2a2d; }
+                    @media (max-width: 700px) {
+                        .picker-btn { width: 100%; margin-right: 0; }
+                        .chback { background: rgba(1, 4, 9, 0.55); }
+                        .chpanel.sheet { top: auto !important; left: 0 !important; right: 0 !important; bottom: 0 !important; width: auto !important; max-height: 70vh !important; border-radius: 12px 12px 0 0; }
+                        .chmodal { padding: 16px; }
+                    }
+"""
+
+CHANNEL_UI_HTML = r"""
+                <div class="chmodalback" id="chDlgBack" hidden>
+                    <div class="chmodal" role="dialog" aria-modal="true" aria-labelledby="chDlgTitle">
+                        <h3 id="chDlgTitle">Add Channel ID</h3>
+                        <label for="chDlgName">Display name <span class="chhint">(Optional but Recommended to prevent confusion)</span></label>
+                        <input type="text" id="chDlgName" maxlength="60" autocomplete="off" placeholder="e.g. Neil's main channel">
+                        <label for="chDlgInput">Handle or Channel ID</label>
+                        <input type="text" id="chDlgInput" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="@handle or UC... (24 characters)">
+                        <p class="chhelp">
+                            A handle (like @name) or a youtube.com link is looked up automatically. If that lookup fails
+                            from the server, paste the channel ID instead (YouTube Studio, Settings, Channel, Advanced settings).
+                            Use the stream creator's channel, not your bot's.
+                        </p>
+                        <p class="chstatus" id="chDlgStatus" role="status" aria-live="polite"></p>
+                        <div class="chactions">
+                            <button type="button" id="chDlgSave" class="add-btn">Save</button>
+                            <button type="button" id="chDlgCancel">Cancel</button>
+                            <button type="button" id="chDlgDelete" class="chdanger" hidden>Delete</button>
+                        </div>
+                    </div>
+                </div>
+"""
+
+CHANNEL_UI_JS = r"""
+(function () {
+    var channels = [];
+    var selectedId = '';      // the Add Live Stream box's choice ('' = none)
+    var panelState = null;    // {anchor, selectedId, onPick} while the dropdown is open
+    var dlgState = null;      // {editingId, lastFocus} while the dialog is open
+    var $ = function (id) { return document.getElementById(id); };
+
+    function shortId(id) { return id.length > 14 ? id.slice(0, 6) + '\u2026' + id.slice(-6) : id; }
+    function labelOf(c) { return c.name || c.handle || shortId(c.id); }
+    function subOf(c) {
+        if (c.name && c.handle) return c.handle + ' (' + shortId(c.id) + ')';
+        if (c.name || c.handle) return shortId(c.id);
+        return '';
+    }
+    function findChannel(id) {
+        for (var i = 0; i < channels.length; i++) { if (channels[i].id === id) return channels[i]; }
+        return null;
+    }
+    function parseJson(r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); }
+
+    function setChannels(list) {
+        channels = (list || []).slice();
+        if (selectedId && !findChannel(selectedId)) selectedId = '';
+        updateTrigger();
+        if (panelState) renderPanel();
+    }
+
+    function updateTrigger() {
+        var btn = $('channelPickerBtn');
+        if (!btn) return;
+        var c = selectedId ? findChannel(selectedId) : null;
+        btn.querySelector('.picker-label').textContent = c ? labelOf(c) : 'Select Channel (optional)';
+        btn.classList.toggle('has-value', !!c);
+    }
+
+    // ---- dropdown panel ----
+    var backdrop = document.createElement('div');
+    backdrop.className = 'chback';
+    backdrop.hidden = true;
+    var panel = document.createElement('div');
+    panel.className = 'chpanel';
+    panel.hidden = true;
+    panel.setAttribute('role', 'dialog');
+    panel.setAttribute('aria-label', 'Select channel');
+    document.body.appendChild(backdrop);
+    document.body.appendChild(panel);
+    backdrop.addEventListener('click', function () { closePicker(); });
+
+    function makeRow(c, st) {
+        var isNone = !c;
+        var isSel = isNone ? !st.selectedId : c.id === st.selectedId;
+        var row = document.createElement('div');
+        row.className = 'chrow' + (isNone ? ' none' : '') + (isSel ? ' sel' : '');
+        row.setAttribute('role', 'option');
+        row.setAttribute('aria-selected', isSel ? 'true' : 'false');
+        row.tabIndex = 0;
+
+        var main = document.createElement('div');
+        main.className = 'chmain';
+        var nm = document.createElement('span');
+        nm.className = 'chname';
+        nm.textContent = isNone ? 'None (automatic lookup)' : labelOf(c);
+        main.appendChild(nm);
+        if (!isNone) {
+            var s = subOf(c);
+            if (s) {
+                var sub = document.createElement('span');
+                sub.className = 'chsub';
+                sub.textContent = s;
+                main.appendChild(sub);
+            }
+        }
+        row.appendChild(main);
+
+        if (!isNone) {
+            var ed = document.createElement('button');
+            ed.type = 'button';
+            ed.className = 'chedit';
+            ed.textContent = '\u270F\uFE0F';
+            ed.title = 'Edit';
+            ed.setAttribute('aria-label', 'Edit ' + labelOf(c));
+            ed.addEventListener('click', function (e) { e.stopPropagation(); openDialog(c); });
+            row.appendChild(ed);
+        }
+
+        row.addEventListener('click', function () { pick(isNone ? '' : c.id); });
+        row.addEventListener('keydown', function (e) {
+            if (e.target !== row) return;
+            if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(isNone ? '' : c.id); return; }
+            if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                e.preventDefault();
+                var rows = Array.prototype.slice.call(panel.querySelectorAll('.chrow'));
+                var next = rows[rows.indexOf(row) + (e.key === 'ArrowDown' ? 1 : -1)];
+                if (next) next.focus();
+            }
+        });
+        return row;
+    }
+
+    function renderPanel() {
+        var st = panelState;
+        if (!st) return;
+        panel.textContent = '';
+        var list = document.createElement('div');
+        list.className = 'chlist';
+        list.setAttribute('role', 'listbox');
+        list.appendChild(makeRow(null, st));
+        if (!channels.length) {
+            var empty = document.createElement('div');
+            empty.className = 'chempty';
+            empty.textContent = 'No saved channels yet. Use Add Channel ID below.';
+            list.appendChild(empty);
+        }
+        channels.forEach(function (c) { list.appendChild(makeRow(c, st)); });
+        panel.appendChild(list);
+
+        var foot = document.createElement('div');
+        foot.className = 'chfoot';
+        var add = document.createElement('button');
+        add.type = 'button';
+        add.className = 'add-btn';
+        add.textContent = '\u2795 Add Channel ID';
+        add.addEventListener('click', function () { openDialog(null); });
+        foot.appendChild(add);
+        panel.appendChild(foot);
+    }
+
+    function positionPanel() {
+        if (!panelState) return;
+        if (window.innerWidth <= 700) {
+            panel.classList.add('sheet');
+            panel.style.top = panel.style.left = panel.style.bottom = panel.style.width = panel.style.maxHeight = '';
+            return;
+        }
+        panel.classList.remove('sheet');
+        var r = panelState.anchor.getBoundingClientRect();
+        var w = Math.min(380, window.innerWidth - 16);
+        var left = Math.max(8, Math.min(r.left, window.innerWidth - w - 8));
+        var below = window.innerHeight - r.bottom - 12;
+        var above = r.top - 12;
+        panel.style.width = w + 'px';
+        panel.style.left = left + 'px';
+        if (below < 240 && above > below) {
+            panel.style.top = 'auto';
+            panel.style.bottom = (window.innerHeight - r.top + 4) + 'px';
+            panel.style.maxHeight = Math.max(160, above) + 'px';
+        } else {
+            panel.style.bottom = 'auto';
+            panel.style.top = (r.bottom + 4) + 'px';
+            panel.style.maxHeight = Math.max(160, below) + 'px';
+        }
+    }
+    window.addEventListener('resize', positionPanel);
+    window.addEventListener('scroll', positionPanel, true);
+
+    function openPicker(anchor, opts) {
+        closePicker(true);
+        panelState = { anchor: anchor, selectedId: opts.selectedId || '', onPick: opts.onPick };
+        renderPanel();
+        backdrop.hidden = false;
+        panel.hidden = false;
+        anchor.setAttribute('aria-expanded', 'true');
+        positionPanel();
+        var first = panel.querySelector('.chrow.sel') || panel.querySelector('.chrow');
+        if (first) first.focus();
+    }
+
+    function closePicker(noRefocus) {
+        if (!panelState) return;
+        var a = panelState.anchor;
+        panelState = null;
+        panel.hidden = true;
+        backdrop.hidden = true;
+        panel.textContent = '';
+        if (a) {
+            a.setAttribute('aria-expanded', 'false');
+            if (!noRefocus && a.focus) a.focus();
+        }
+    }
+
+    function pick(id) {
+        var st = panelState;
+        if (!st) return;
+        closePicker(true);
+        st.onPick(id);
+    }
+
+    // ---- add / edit dialog ----
+    var dlgBack = $('chDlgBack');
+    function setStatus(msg, isErr) {
+        var el = $('chDlgStatus');
+        el.textContent = msg || '';
+        el.classList.toggle('err', !!isErr);
+    }
+    function setBusy(busy) {
+        ['chDlgSave', 'chDlgCancel', 'chDlgDelete'].forEach(function (id) { $(id).disabled = busy; });
+    }
+
+    function openDialog(c) {
+        dlgState = { editingId: c ? c.id : '', lastFocus: document.activeElement };
+        $('chDlgTitle').textContent = c ? 'Edit Channel' : 'Add Channel ID';
+        $('chDlgName').value = c ? c.name : '';
+        $('chDlgInput').value = c ? (c.handle || c.id) : '';
+        $('chDlgDelete').hidden = !c;
+        setStatus('');
+        setBusy(false);
+        dlgBack.hidden = false;
+        // Add: start on the display name (recommended). Edit: same.
+        setTimeout(function () { $('chDlgName').focus(); }, 30);
+    }
+
+    function closeDialog() {
+        if (!dlgState) return;
+        var back = dlgState.lastFocus;
+        dlgState = null;
+        dlgBack.hidden = true;
+        if (back && back.focus && document.body.contains(back)) back.focus();
+    }
+
+    function saveDialog() {
+        if (!dlgState) return;
+        var editedId = dlgState.editingId;
+        var name = $('chDlgName').value.trim();
+        var input = $('chDlgInput').value.trim();
+        if (!input) { setStatus('Enter a handle or a channel ID.', true); return; }
+
+        setBusy(true);
+        setStatus(/^@|youtube\.com/i.test(input) || !/^UC/.test(input) ? 'Looking up the channel\u2026' : 'Saving\u2026');
+        fetch('/api/channels', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: editedId, name: name, input: input })
+        }).then(parseJson).then(function (res) {
+            setBusy(false);
+            var d = res.d || {};
+            if (!res.ok) {
+                if (d.channels) setChannels(d.channels);
+                setStatus(d.message || 'Could not save.', true);
+                return;
+            }
+            // Editing can change the ID (re-keyed): keep any selection pointing at it.
+            if (editedId && d.channel && d.channel.id !== editedId) {
+                if (selectedId === editedId) selectedId = d.channel.id;
+                if (panelState && panelState.selectedId === editedId) panelState.selectedId = d.channel.id;
+            }
+            setChannels(d.channels);
+            closeDialog();
+            // Newly added channel: select it right away.
+            if (!editedId && d.channel && panelState) pick(d.channel.id);
+        }).catch(function (e) {
+            setBusy(false);
+            setStatus('Error: ' + e, true);
+        });
+    }
+
+    function deleteFromDialog() {
+        if (!dlgState || !dlgState.editingId) return;
+        var id = dlgState.editingId;
+        var c = findChannel(id);
+        if (!confirm('Delete "' + (c ? labelOf(c) : id) + '" from the saved list?\nStreams already using it keep their channel ID.')) return;
+        setBusy(true);
+        setStatus('Deleting\u2026');
+        fetch('/api/channels/' + encodeURIComponent(id), { method: 'DELETE' })
+            .then(parseJson).then(function (res) {
+                setBusy(false);
+                var d = res.d || {};
+                if (d.channels) setChannels(d.channels);
+                if (!res.ok) { setStatus(d.message || 'Could not delete.', true); return; }
+                if (panelState && panelState.selectedId === id) panelState.selectedId = '';
+                closeDialog();
+                if (panelState) renderPanel();
+            }).catch(function (e) {
+                setBusy(false);
+                setStatus('Error: ' + e, true);
+            });
+    }
+
+    $('chDlgSave').addEventListener('click', saveDialog);
+    $('chDlgCancel').addEventListener('click', function () { closeDialog(); });
+    $('chDlgDelete').addEventListener('click', deleteFromDialog);
+    ['chDlgName', 'chDlgInput'].forEach(function (id) {
+        $(id).addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); saveDialog(); } });
+    });
+
+    // Keep Tab inside the dialog while it is open.
+    dlgBack.addEventListener('keydown', function (e) {
+        if (e.key !== 'Tab') return;
+        var items = Array.prototype.slice.call(dlgBack.querySelectorAll('input, button')).filter(function (el) {
+            return !el.disabled && !el.hidden && el.offsetParent !== null;
+        });
+        if (!items.length) return;
+        var first = items[0], last = items[items.length - 1];
+        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+        else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+    });
+
+    // Escape closes the dialog first, then the dropdown.
+    document.addEventListener('keydown', function (e) {
+        if (e.key !== 'Escape') return;
+        if (dlgState) { if (!$('chDlgSave').disabled) closeDialog(); }
+        else if (panelState) closePicker();
+    });
+
+    // ---- wiring ----
+    var trigger = $('channelPickerBtn');
+    if (trigger) {
+        trigger.addEventListener('click', function () {
+            openPicker(trigger, {
+                selectedId: selectedId,
+                onPick: function (id) { selectedId = id; updateTrigger(); }
+            });
+        });
+    }
+
+    window.getSelectedChannelId = function () { return selectedId; };
+
+    // Per-row "Change Channel" button in the streams table.
+    window.changeChannel = function (videoId, currentId, btn) {
+        openPicker(btn, {
+            selectedId: currentId,
+            onPick: function (id) {
+                if (id === currentId) return;
+                fetch('/api/streams', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ video_id: videoId, channel_id: id })
+                }).then(function (r) { return r.json(); }).then(function (data) {
+                    alert(data.message);
+                    location.reload();
+                }).catch(function (e) { alert('Error: ' + e); });
+            }
+        });
+    };
+
+    setChannels(window.__SAVED_CHANNELS__ || []);
+})();
+"""
+
 # --- Render Port Binding & HTTP Server ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def _client_ip(self):
@@ -1210,6 +1809,93 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
 
     def _handle_logout(self):
         self._send_json(200, {"message": "Logged out."}, [("Set-Cookie", self._cookie_header("", 0))])
+
+    def _handle_channels_api(self, route):
+        """GET/POST/DELETE for the saved-channel list (POST/DELETE are sudo-guarded in do_GET)."""
+        if self.command == "GET":
+            self._send_json(200, {"channels": list_saved_channels()})
+            return
+
+        if self.command == "DELETE":
+            channel_id = urllib.parse.unquote(route.rsplit("/", 1)[-1])
+            existing = get_saved_channel(channel_id)
+            if existing is None:
+                self._send_json(404, {"message": "That channel isn't in the saved list.", "channels": list_saved_channels()})
+                return
+            delete_saved_channel(channel_id)
+            label = channel_display_name(channel_id, existing)
+            add_log(f"Saved channel '{label}' ({channel_id}) deleted.")
+            self._send_json(200, {
+                "message": f"Deleted '{label}'. Streams already using it keep their channel ID.",
+                "channels": list_saved_channels(),
+            })
+            return
+
+        if self.command != "POST":
+            self._send_json(405, {"message": "Method not allowed."})
+            return
+
+        try:
+            length = min(int(self.headers.get('Content-Length', 0)), 8192)
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(body, dict):
+                raise ValueError("body must be an object")
+        except Exception:
+            self._send_json(400, {"message": "Bad request."})
+            return
+
+        editing_id = str(body.get("id") or "").strip()
+        name = str(body.get("name") or "").strip()[:60]
+        input_text = str(body.get("input") or "").strip()[:300]
+
+        if not input_text:
+            self._send_json(400, {"message": "Enter a handle or a channel ID."})
+            return
+
+        old = None
+        if editing_id:
+            old = get_saved_channel(editing_id)
+            if old is None:
+                self._send_json(404, {"message": "That channel no longer exists. Close this and try again.", "channels": list_saved_channels()})
+                return
+
+        # Edit with the ID/handle field left as it was: just rename, no new lookup.
+        unchanged = False
+        if old is not None:
+            unchanged = input_text == editing_id or (
+                bool(old["handle"]) and input_text.lstrip("@").lower() == old["handle"].lstrip("@").lower()
+            )
+
+        if unchanged:
+            channel_id, handle, fetched_name = editing_id, old["handle"], ""
+        else:
+            resolved, error = resolve_channel_input(input_text)
+            if error:
+                self._send_json(400, {"message": error})
+                return
+            channel_id, handle, fetched_name = resolved["channel_id"], resolved["handle"], resolved.get("name", "")
+
+        if channel_id != editing_id:
+            duplicate = get_saved_channel(channel_id)
+            if duplicate is not None:
+                self._send_json(409, {
+                    "message": f"That channel is already saved as '{channel_display_name(channel_id, duplicate)}'.",
+                    "channels": list_saved_channels(),
+                })
+                return
+
+        if not editing_id and not name:
+            name = fetched_name[:60]
+
+        upsert_saved_channel(channel_id, name, handle, replace_id=editing_id or None)
+        saved = {"id": channel_id, "name": name, "handle": handle}
+        label = channel_display_name(channel_id, saved)
+        add_log(f"Saved channel '{label}' ({channel_id}) {'updated' if editing_id else 'added'}.")
+        self._send_json(200, {
+            "message": f"Saved '{label}'.",
+            "channel": saved,
+            "channels": list_saved_channels(),
+        })
 
     def _inject_sudo(self, page_html):
         page_html = add_mobile_support(page_html)
@@ -1316,6 +2002,12 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             with active_streams_lock:
                 running_ids = set(active_stream_ids)
 
+            saved_by_id = {c["id"]: c for c in list_saved_channels()}
+            channels_json = (
+                json.dumps(list(saved_by_id.values()))
+                .replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+            )
+
             stream_rows = ""
             for video_id, data in streams.items():
                 raw_label = data.get('label', '') or ''
@@ -1324,16 +2016,23 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                 label_btn_text = "✏️ Edit/Remove Label" if raw_label else "➕ Add Label"
                 escaped_label = raw_label.replace("\\", "\\\\").replace("'", "\\'")
                 raw_channel_id = (data.get('channel_id', '') or '') if isinstance(data, dict) else ''
-                channel_btn_text = "✏️ Edit/Remove Channel ID" if raw_channel_id else "➕ Add Channel ID"
                 escaped_channel_id = raw_channel_id.replace("\\", "\\\\").replace("'", "\\'")
+                if raw_channel_id:
+                    saved_channel = saved_by_id.get(raw_channel_id)
+                    channel_cell = html_lib.escape(channel_display_name(raw_channel_id, saved_channel))
+                    if saved_channel and (saved_channel["name"] or saved_channel["handle"]):
+                        channel_cell += f'<br><code style="font-size: 11px; color: #8b949e;">{html_lib.escape(_short_channel_id(raw_channel_id))}</code>'
+                else:
+                    channel_cell = '<span style="color: #8b949e;">Automatic</span>'
                 stream_rows += f"""
                 <tr>
                     <td><code>{video_id}</code></td>
                     <td>{label}</td>
+                    <td>{channel_cell}</td>
                     <td>{status}</td>
                     <td>
                         <button onclick="editLabel('{video_id}', '{escaped_label}')">{label_btn_text}</button>
-                        <button onclick="editChannelId('{video_id}', '{escaped_channel_id}')">{channel_btn_text}</button>
+                        <button onclick="changeChannel('{video_id}', '{escaped_channel_id}', this)" aria-haspopup="dialog" aria-expanded="false">📺 Change Channel</button>
                         <button onclick="removeStream('{video_id}')">Remove</button>
                     </td>
                 </tr>
@@ -1363,6 +2062,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                     .copy-btn:hover {{ background: #bb8009; }}
                     .restore-btn {{ background: #1f6feb; color: white; font-weight: bold; }}
                     .restore-btn:hover {{ background: #1a5cc4; }}
+{CHANNEL_UI_CSS}
                 </style>
             </head>
             <body>
@@ -1388,13 +2088,13 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                         </p>
                         <input type="text" id="videoIdInput" placeholder="Video ID (e.g. BblhFWoDyWk)" style="width: 220px;">
                         <input type="text" id="labelInput" placeholder="Label (optional)" style="width: 180px;">
-                        <input type="text" id="channelIdInput" placeholder="Channel ID (optional)" style="width: 240px;">
+                        <button type="button" id="channelPickerBtn" class="picker-btn" aria-haspopup="dialog" aria-expanded="false"><span class="picker-label">Select Channel (optional)</span><span class="caret" aria-hidden="true">▾</span></button>
                         <button class="add-btn" onclick="addStream()">▶ Start Listening</button>
                         <p style="font-size: 12px; color: #8b949e; margin: 6px 0 0 0;">
-                            Channel ID is a last resort — only fill it in if pytchat can't find the channel on its own
-                            (for example, the creator turned off embedding and the lookups fail from the cloud server).
-                            Use the stream creator's channel ID (starts with UC, 24 characters), not your bot's.
-                            It's in YouTube Studio under Settings, Channel, Advanced settings.
+                            Selecting a channel is optional and a last resort: only pick one if pytchat can't find the
+                            channel on its own (for example, the creator turned off embedding and the lookups fail from
+                            the cloud server). Pick the stream creator's channel, not your bot's. New channel? Open the
+                            dropdown and tap Add Channel ID.
                         </p>
                     </div>
 
@@ -1403,10 +2103,11 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                         <tr>
                             <th>Video ID</th>
                             <th>Label</th>
+                            <th>Channel</th>
                             <th>Status</th>
                             <th>Actions</th>
                         </tr>
-                        {stream_rows or "<tr><td colspan='4'>No streams added yet.</td></tr>"}
+                        {stream_rows or "<tr><td colspan='5'>No streams added yet.</td></tr>"}
                     </table>
                 </div>
 
@@ -1414,7 +2115,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                     function addStream() {{
                         const videoId = document.getElementById('videoIdInput').value.trim();
                         const label = document.getElementById('labelInput').value.trim();
-                        const channelId = document.getElementById('channelIdInput').value.trim();
+                        const channelId = window.getSelectedChannelId ? window.getSelectedChannelId() : '';
 
                         if (!videoId) {{
                             alert('Please enter a Video ID!');
@@ -1442,27 +2143,6 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                     const CHANNEL_ID_HELP = 'That is not a valid channel ID. It should start with UC and be 24 characters long.';
                     function isValidChannelId(value) {{
                         return /^UC[0-9A-Za-z_-]{{22}}$/.test(value);
-                    }}
-
-                    function editChannelId(videoId, currentChannelId) {{
-                        const result = prompt('Channel ID for this stream (starts with UC). Leave blank to remove:', currentChannelId);
-                        if (result === null) return;  // Cancelled
-
-                        const newChannelId = result.trim();
-                        if (newChannelId && !isValidChannelId(newChannelId)) {{
-                            alert(CHANNEL_ID_HELP);
-                            return;
-                        }}
-
-                        // Only video_id + channel_id are sent, so the saved label is left alone.
-                        fetch('/api/streams', {{
-                            method: 'POST',
-                            headers: {{'Content-Type': 'application/json'}},
-                            body: JSON.stringify({{video_id: videoId, channel_id: newChannelId}})
-                        }}).then(r => r.json()).then(data => {{
-                            alert(data.message);
-                            location.reload();
-                        }}).catch(e => alert('Error: ' + e));
                     }}
 
                     function editLabel(videoId, currentLabel) {{
@@ -1547,6 +2227,9 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                         }});
                     }}
                 </script>
+                <script>window.__SAVED_CHANNELS__ = {channels_json};</script>
+{CHANNEL_UI_HTML}
+                <script>{CHANNEL_UI_JS}</script>
             </body>
             </html>
             """
@@ -1792,6 +2475,9 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             html_content = self._inject_sudo(html_content)
             self.wfile.write(html_content.encode("utf-8"))
 
+        elif route == "/api/channels" or route.startswith("/api/channels/"):
+            self._handle_channels_api(route)
+
         elif self.path.startswith("/api/streams"):
             if self.command == "GET":
                 self.send_response(200)
@@ -1843,6 +2529,8 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                         record.pop('channel_id', None)
                 streams[video_id] = record
                 save_streams(streams)
+                if has_channel_field and channel_id:
+                    ensure_channel_saved(channel_id)  # so it shows up in the Select Channel dropdown
 
                 # Keep the pytchat patch's last-resort lookup in sync with what was saved.
                 pytchat_oembed_patch.set_manual_channel_id(video_id, record.get('channel_id'))
@@ -3408,6 +4096,10 @@ def main():
     )
 
     streams = load_streams()
+
+    imported = import_stream_channels_once(streams)
+    if imported:
+        add_log(f"Imported {imported} channel ID(s) from saved streams into the Select Channel list.")
 
     if not streams:
         add_log("⚠️  No streams configured yet.")
