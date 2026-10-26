@@ -22,14 +22,26 @@ manually on the bot's /live dashboard is used instead. The bot registers
 those with set_manual_channel_id(); it is only consulted after the two
 automatic lookups fail.
 
+v0.1.2 adds helpers for the bot's "Select Channel" list on /live:
+  - parse_channel_input(text): classifies what was typed as a channel ID,
+    an @handle, or a youtube.com URL containing either.
+  - resolve_handle_to_channel_id(handle): turns an @handle into a channel ID
+    (and the channel's display name) using the same "/about" page +
+    "externalId" technique the oEmbed path uses for @handle author URLs.
+    The oEmbed endpoint itself needs a video URL, so it can't look up a bare
+    handle. Returns None on any failure so the caller can fall back (the bot
+    then tries the YouTube Data API, then asks for the UC... ID).
+Nothing in the pytchat patching logic itself changed.
+
 Usage: import and call apply_patch() *before* calling pytchat.create()
 or constructing any pytchat chat object.
 """
 
+import html as _html
 import re
 import threading
 import httpx
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 import pytchat.util as _pytchat_util
 from pytchat import config
@@ -146,6 +158,110 @@ def patched_get_channelid(client, video_id):
                 "Try adding the channel ID in the /live dashboard."
             )
         raise
+
+
+# ---------------------------------------------------------------------------
+# v0.1.2: handle / channel-ID input helpers for the bot's saved-channel list
+# ---------------------------------------------------------------------------
+
+# YouTube handles: 3-30 characters of letters, digits, '.', '_' or '-'.
+_HANDLE_RE = re.compile(r"^@?([A-Za-z0-9._-]{3,30})$")
+
+# A desktop-style request plus a consent cookie, so Google's EU-style consent
+# interstitial is less likely to replace the channel page.
+_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cookie": "CONSENT=YES+1; SOCS=CAI",
+}
+
+_CANONICAL_RE = re.compile(
+    r'<link\s+rel="canonical"\s+href="https?://www\.youtube\.com/channel/(UC[0-9A-Za-z_-]{22})"'
+)
+_ITEMPROP_RE = re.compile(
+    r'<meta\s+itemprop="(?:identifier|channelId)"\s+content="(UC[0-9A-Za-z_-]{22})"'
+)
+_EXTERNAL_ID_RE = re.compile(r'"externalId":"(UC[0-9A-Za-z_-]{22})"')
+_OG_TITLE_RE = re.compile(r'<meta\s+property="og:title"\s+content="([^"]*)"')
+
+
+def parse_channel_input(text):
+    """
+    Classify what the user typed. Returns (kind, value):
+      ("id", "UC...")      a well-formed channel ID, or a /channel/UC... URL
+      ("handle", "@name")  an @handle, a bare handle, or a youtube.com/@name URL
+      (None, "")           unrecognised / malformed
+    """
+    s = (text or "").strip()
+    if not s:
+        return (None, "")
+
+    if is_valid_channel_id(s):
+        return ("id", s)
+
+    lowered = s.lower()
+    if "youtube.com" in lowered or "youtu.be" in lowered:
+        m = re.search(r"/channel/(UC[0-9A-Za-z_-]{22})", s)
+        if m:
+            return ("id", m.group(1))
+        m = re.search(r"/@([^/?#\s]+)", s)
+        if m:
+            handle = unquote(m.group(1))
+            if _HANDLE_RE.match(handle):
+                return ("handle", "@" + handle.lstrip("@"))
+        return (None, "")
+
+    # Something that looks like a (malformed) channel ID shouldn't be
+    # mistaken for a handle and sent off to be looked up.
+    if "@" not in s and s.startswith("UC") and len(s) >= 20:
+        return (None, "")
+
+    m = _HANDLE_RE.match(s)
+    if m:
+        return ("handle", "@" + m.group(1))
+    return (None, "")
+
+
+def resolve_handle_to_channel_id(handle: str):
+    """
+    Resolve an @handle to its channel ID by reading the channel's /about page,
+    the same technique used for @handle author URLs in the oEmbed path.
+
+    Returns {"channel_id": "UC...", "name": "Display Name"} (name may be "")
+    or None if the page couldn't be fetched or no ID was found in it.
+    """
+    handle = "@" + (handle or "").lstrip("@")
+    if not _HANDLE_RE.match(handle):
+        return None
+
+    url = f"https://www.youtube.com/{quote(handle, safe='@')}/about"
+    try:
+        with httpx.Client(timeout=10, follow_redirects=True, headers=_BROWSER_HEADERS) as client:
+            resp = client.get(url)
+            if resp.status_code != 200:
+                return None
+            page = resp.text
+    except Exception:
+        return None
+
+    channel_id = None
+    for pattern in (_CANONICAL_RE, _ITEMPROP_RE, _EXTERNAL_ID_RE):
+        m = pattern.search(page)
+        if m:
+            channel_id = m.group(1)
+            break
+    if not channel_id:
+        return None
+
+    name = ""
+    m = _OG_TITLE_RE.search(page)
+    if m:
+        name = _html.unescape(m.group(1)).strip()
+
+    return {"channel_id": channel_id, "name": name}
 
 
 def apply_patch():
