@@ -4,3 +4,4 @@ google-auth-httplib2
 python-dotenv
 pytchat
 httpx
+certifi>=2026.10.19
