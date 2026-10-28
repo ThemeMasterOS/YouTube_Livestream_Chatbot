@@ -17,6 +17,7 @@ import hashlib
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from collections import deque
+from contextlib import contextmanager
 from http.cookies import SimpleCookie
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from dotenv import load_dotenv
@@ -32,7 +33,118 @@ import pytchat
 # ------------------------------------------------------------------
 
 
+# --- Connection queue (v0.2.7.1) ----------------------------------------
+# Limits how many streams may attempt to connect / reconnect to live chat at
+# the same time (getLiveChatId + pytchat.create). Waiting streams are served
+# strictly first-come-first-served. A slot is held ONLY while the connect call
+# itself runs, never during sleeps, retry delays or normal chat listening.
+def _env_number(name, default, cast, minimum):
+    try:
+        return max(minimum, cast(os.getenv(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+MAX_CONCURRENT_CONNECTS = _env_number("MAX_CONCURRENT_CONNECTS", 2, int, 1)
+CONNECT_MIN_SPACING = _env_number("CONNECT_MIN_SPACING", 2.0, float, 0.0)  # seconds between attempt starts
+CONNECT_QUEUE_LOG_THRESHOLD = 5  # seconds; log "got a slot" only if the wait was longer than this
+
+
+class ConnectionQueueCancelled(Exception):
+    """Raised when a stream is removed (stop flag set) while waiting in the connection queue."""
+
+
+class ConnectionGate:
+    def __init__(self, max_concurrent, min_spacing):
+        self._max = max_concurrent
+        self._spacing = min_spacing
+        self._cond = threading.Condition()
+        self._queue = deque()      # tickets, oldest first
+        self._active = 0
+        self._next_start = 0.0     # earliest time the next attempt may start
+
+    @staticmethod
+    def _cancelled(stream_id):
+        flag = stop_flags.get(stream_id)   # popped by stop_stream_listener() on Remove
+        return flag is None or flag.is_set()
+
+    def _leave_queue(self, ticket):
+        with self._cond:
+            try:
+                self._queue.remove(ticket)
+            except ValueError:
+                pass
+            self._cond.notify_all()
+
+    def acquire(self, stream_id):
+        ticket = object()
+        queued_at = time.time()
+        with self._cond:
+            must_wait = self._active >= self._max or bool(self._queue)
+            self._queue.append(ticket)
+            position = len(self._queue)
+        if must_wait:
+            add_log(f"⏳ '{stream_id}' queued for live chat connection (position {position}).")
+
+        with self._cond:
+            while True:
+                if self._cancelled(stream_id):
+                    try:
+                        self._queue.remove(ticket)
+                    except ValueError:
+                        pass
+                    self._cond.notify_all()
+                    raise ConnectionQueueCancelled(f"'{stream_id}' stopped while waiting in the connection queue")
+                if self._queue[0] is ticket and self._active < self._max:
+                    break
+                self._cond.wait(1.0)
+            self._queue.popleft()
+            self._active += 1
+            now = time.time()
+            start_at = max(now, self._next_start)
+            self._next_start = start_at + self._spacing + random.uniform(0, 0.5)
+            self._cond.notify_all()
+
+        # Spacing delay (outside the lock, still holding the slot), stop-aware
+        try:
+            while True:
+                remaining = start_at - time.time()
+                if remaining <= 0:
+                    break
+                if self._cancelled(stream_id):
+                    raise ConnectionQueueCancelled(f"'{stream_id}' stopped while waiting in the connection queue")
+                time.sleep(min(remaining, 0.5))
+        except BaseException:
+            self.release()
+            raise
+
+        waited = time.time() - queued_at
+        if must_wait and waited >= CONNECT_QUEUE_LOG_THRESHOLD:
+            add_log(f"🔌 '{stream_id}' got a live chat connection slot after {waited:.0f} s.")
+
+    def release(self):
+        with self._cond:
+            self._active = max(0, self._active - 1)
+            self._cond.notify_all()
+
+    @contextmanager
+    def slot(self, stream_id):
+        self.acquire(stream_id)
+        try:
+            yield
+        finally:
+            self.release()
+
+
+CONNECTION_GATE = ConnectionGate(MAX_CONCURRENT_CONNECTS, CONNECT_MIN_SPACING)
+
+
 def safe_pytchat_create(video_id):
+    """Queued entry point: waits for a connection slot, then creates the pytchat chat."""
+    with CONNECTION_GATE.slot(video_id):
+        return _safe_pytchat_create_unqueued(video_id)
+
+
+def _safe_pytchat_create_unqueued(video_id):
     """
     pytchat.create() internally calls signal.signal(signal.SIGINT, ...) to
     handle Ctrl+C cleanup. That call raises ValueError("signal only works
@@ -3530,7 +3642,7 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
         return time.time()
 
     elif lower_msg in ["!commands", "!help"]:
-        cmd_url = "http://217.154.36.84:8011/commands"
+        cmd_url = "https://youtube-livestream-chatbot.onrender.com/commands"
         sendReplyToLiveChat(liveChatId, f"{userName} -> The bot commands are available at {cmd_url}", stream_name=stream_name)
         return time.time()
 
@@ -3724,7 +3836,7 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
         return time.time()
 
     elif lower_msg == "!leaderboard":
-        theme_master = "http://217.154.36.84:8011/leaderboard"
+        theme_master = "https://youtube-livestream-chatbot.onrender.com/leaderboard"
         sendReplyToLiveChat(liveChatId, f"{userName} -> The leaderboard is available at {theme_master}", stream_name=stream_name)
         return time.time()
 
@@ -3778,8 +3890,12 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
             add_log(f"'{stream_name}' ({stream_id}) stopped before chat became available.")
             return
         try:
-            liveChatId = getLiveChatId(stream_id)
+            with CONNECTION_GATE.slot(stream_id):
+                liveChatId = getLiveChatId(stream_id)
             add_log(f"Started listening to '{stream_name}' ({stream_id})")
+        except ConnectionQueueCancelled:
+            add_log(f"'{stream_name}' ({stream_id}) stopped while waiting in the connection queue.")
+            return
         except AllQuotasExhausted as qe:
             add_log(f"All API quotas exhausted while connecting '{stream_name}' ({stream_id}). Waiting until 00:00 PT ({qe.utc_offset_label} UTC) to retry...")
             deadline = time.time() + qe.wait_seconds + 5  # small buffer past the reset
@@ -3841,6 +3957,9 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
         if not chat.is_alive():
             raise Exception(f"Pytchat stream initialization failed ({describe_pytchat_stop(chat)}).")
         add_log(f"Listening to '{stream_name}' via pytchat...")
+    except ConnectionQueueCancelled:
+        add_log(f"'{stream_name}' ({stream_id}) stopped while waiting in the connection queue.")
+        return
     except Exception as e:
         if active_youtube_backup is None:
             add_log(f"Pytchat failed for '{stream_name}' ({e}). No backup API configured — stopping listener.")
@@ -4022,6 +4141,8 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
                             continue
                         else:
                             raise Exception(f"Pytchat stream initialization failed ({describe_pytchat_stop(test_chat)}).")
+                    except ConnectionQueueCancelled:
+                        break  # removed while queued; the code after the loop logs the stop
                     except Exception as pytchat_error:
                         wait_seconds, utc_offset_label = seconds_until_next_midnight_pt()
                         add_log(f"Pytchat restore failed for '{stream_name}': {pytchat_error}. Pausing until 00:00 PT ({utc_offset_label} UTC).")
