@@ -978,6 +978,59 @@ def mark_stream_stopped(video_id):
 
 
 
+# --- Bulk stream delete (v0.2.8.0) -----------------------------------------
+BULK_DELETE_MAX = 500   # safety cap on one Delete Selected request
+
+
+def _remove_stream_record(streams, video_id):
+    """
+    Same cleanup the single-stream Remove (DELETE /api/streams/<id>) performs,
+    minus the save: drops the record from the in-memory `streams` dict, stops
+    its listener, and clears its manual channel ID and pending pytchat retry.
+    Returns (existed, was_running). The caller saves `streams` once.
+    """
+    existed = video_id in streams
+    if existed:
+        del streams[video_id]
+    with active_streams_lock:
+        was_running = video_id in active_stream_ids
+    stop_stream_listener(video_id)
+    pytchat_oembed_patch.set_manual_channel_id(video_id, None)
+    _clear_pytchat_retry_request(video_id)
+    return existed, was_running
+
+
+def delete_streams_bulk(video_ids=None, only_stopped=False):
+    """
+    Delete many streams with ONE load and ONE save (saves can sync to GitHub).
+    video_ids: explicit IDs for Delete Selected.
+    only_stopped: delete every saved stream that has no running listener right
+    now (decided here, on the server, so a stale /live page can't delete a
+    stream that has since gone live).
+    """
+    streams = load_streams()
+    if only_stopped:
+        video_ids = list(streams.keys())
+    deleted = stopped_running = not_found = 0
+    for video_id in (video_ids or []):
+        if only_stopped:
+            with active_streams_lock:
+                if video_id in active_stream_ids:
+                    continue  # went live since the page loaded: leave it alone
+        existed, was_running = _remove_stream_record(streams, video_id)
+        if existed:
+            deleted += 1
+            if was_running:
+                stopped_running += 1
+        else:
+            not_found += 1
+    if deleted:
+        save_streams(streams)
+    kind = "stopped streams" if only_stopped else "selected streams"
+    add_log(f"Bulk delete ({kind}): removed {deleted} stream(s) ({stopped_running} were listening and got stopped).")
+    return {"deleted": deleted, "stopped_running": stopped_running, "not_found": not_found}
+
+
 def get_logs_since(since_id):
     """Return (latest_id, [{'id':..,'text':..}, ...]) for entries newer than since_id, oldest first."""
     with _log_lock:
@@ -2011,6 +2064,36 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             "channels": list_saved_channels(),
         })
 
+    def _handle_bulk_delete(self, route):
+        """POST /api/streams/delete-selected and /api/streams/delete-stopped (sudo-guarded in do_GET)."""
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+            raw = self.rfile.read(length).decode('utf-8') if length else ''
+            body = json.loads(raw) if raw.strip() else {}
+        except (ValueError, UnicodeDecodeError):
+            self._send_json(400, {"message": "Invalid request."})
+            return
+
+        if route == "/api/streams/delete-stopped":
+            result = delete_streams_bulk(only_stopped=True)
+            if result["deleted"] == 0:
+                message = "No stopped streams to delete."
+            else:
+                message = f"Deleted {result['deleted']} stopped stream(s)."
+        else:
+            ids = body.get("video_ids") if isinstance(body, dict) else None
+            if (not isinstance(ids, list) or not ids or len(ids) > BULK_DELETE_MAX
+                    or any(not isinstance(v, str) or not v for v in ids)):
+                self._send_json(400, {"message": "Select at least one stream first."})
+                return
+            result = delete_streams_bulk(video_ids=list(dict.fromkeys(ids)))
+            message = f"Deleted {result['deleted']} stream(s)."
+            if result["stopped_running"]:
+                message += f" {result['stopped_running']} were listening and have been stopped."
+            if result["not_found"]:
+                message += f" {result['not_found']} were not found."
+        self._send_json(200, dict(result, message=message))
+
     def _inject_sudo(self, page_html):
         page_html = add_mobile_support(page_html)
         snippet = SUDO_SNIPPET.replace("__ADMIN__", "true" if self._is_admin() else "false")
@@ -2140,6 +2223,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                     channel_cell = '<span style="color: #8b949e;">Automatic</span>'
                 stream_rows += f"""
                 <tr>
+                    <td><input type="checkbox" class="stream-check" autocomplete="off" data-id="{html_lib.escape(video_id, quote=True)}" data-running="{1 if video_id in running_ids else 0}" aria-label="Select stream"></td>
                     <td><code>{video_id}</code></td>
                     <td>{label}</td>
                     <td>{channel_cell}</td>
@@ -2151,6 +2235,9 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                     </td>
                 </tr>
                 """
+
+            stopped_count = sum(1 for vid in streams if vid not in running_ids)
+            stopped_disabled = "" if stopped_count else " disabled"
 
             html_content = f"""
             <!DOCTYPE html>
@@ -2176,6 +2263,12 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                     .copy-btn:hover {{ background: #bb8009; }}
                     .restore-btn {{ background: #1f6feb; color: white; font-weight: bold; }}
                     .restore-btn:hover {{ background: #1a5cc4; }}
+                    .bulk-bar {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }}
+                    .bulk-bar button {{ margin: 0; }}
+                    .danger-btn {{ background: #da3633; color: #ffffff; border-color: #da3633; font-weight: bold; }}
+                    .danger-btn:hover {{ background: #b62324; border-color: #b62324; }}
+                    .danger-btn:disabled {{ opacity: 0.45; cursor: not-allowed; }}
+                    .stream-check, #selectAllStreams {{ width: 20px; height: 20px; cursor: pointer; }}
 {CHANNEL_UI_CSS}
                 </style>
             </head>
@@ -2213,15 +2306,20 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                     </div>
 
                     <h2>📺 Active Streams</h2>
+                    <div class="bulk-bar">
+                        <button type="button" id="deleteSelectedBtn" class="danger-btn" onclick="deleteSelectedStreams()" disabled>🗑️ Delete Selected (0)</button>
+                        <button type="button" id="deleteStoppedBtn" class="danger-btn" onclick="deleteStoppedStreams()"{stopped_disabled}>🧹 Delete Stopped Streams ({stopped_count})</button>
+                    </div>
                     <table>
                         <tr>
+                            <th><input type="checkbox" id="selectAllStreams" autocomplete="off" onchange="toggleAllStreams(this)" aria-label="Select all streams"></th>
                             <th>Video ID</th>
                             <th>Label</th>
                             <th>Channel</th>
                             <th>Status</th>
                             <th>Actions</th>
                         </tr>
-                        {stream_rows or "<tr><td colspan='5'>No streams added yet.</td></tr>"}
+                        {stream_rows or "<tr><td colspan='6'>No streams added yet.</td></tr>"}
                     </table>
                 </div>
 
@@ -2271,6 +2369,60 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                         }}).then(r => r.json()).then(data => {{
                             location.reload();
                         }}).catch(e => alert('Error: ' + e));
+                    }}
+
+                    const BULK_FOOTER = "\\n\\nThis can't be undone. Use Copy Current Streams first if unsure.";
+
+                    function streamChecks() {{
+                        return Array.from(document.querySelectorAll('.stream-check'));
+                    }}
+
+                    function updateBulkUI() {{
+                        const checks = streamChecks();
+                        const n = checks.filter(c => c.checked).length;
+                        const btn = document.getElementById('deleteSelectedBtn');
+                        btn.disabled = (n === 0);
+                        btn.textContent = '🗑️ Delete Selected (' + n + ')';
+                        const all = document.getElementById('selectAllStreams');
+                        all.checked = checks.length > 0 && n === checks.length;
+                        all.indeterminate = n > 0 && n < checks.length;
+                    }}
+
+                    function toggleAllStreams(src) {{
+                        streamChecks().forEach(c => {{ c.checked = src.checked; }});
+                        updateBulkUI();
+                    }}
+
+                    document.addEventListener('change', function (e) {{
+                        if (e.target.classList && e.target.classList.contains('stream-check')) updateBulkUI();
+                    }});
+
+                    function bulkDeleteRequest(url, payload) {{
+                        fetch(url, {{
+                            method: 'POST',
+                            headers: {{'Content-Type': 'application/json'}},
+                            body: JSON.stringify(payload)
+                        }}).then(r => r.json())
+                          .then(data => {{
+                              alert(data.message);
+                              location.reload();
+                          }})
+                          .catch(e => alert('Error: ' + e));
+                    }}
+
+                    function deleteSelectedStreams() {{
+                        const checked = streamChecks().filter(c => c.checked);
+                        if (checked.length === 0) return;
+                        const running = checked.filter(c => c.dataset.running === '1').length;
+                        let msg = `Delete ${{checked.length}} stream(s)?`;
+                        if (running > 0) msg += `\\n${{running}} currently listening and will be stopped.`;
+                        if (!confirm(msg + BULK_FOOTER)) return;
+                        bulkDeleteRequest('/api/streams/delete-selected', {{video_ids: checked.map(c => c.dataset.id)}});
+                    }}
+
+                    function deleteStoppedStreams() {{
+                        if (!confirm(`Delete all stopped stream(s)? (${{{stopped_count}}} shown as stopped)` + BULK_FOOTER)) return;
+                        bulkDeleteRequest('/api/streams/delete-stopped', {{}});
                     }}
 
                     function removeStream(videoId) {{
@@ -2591,6 +2743,9 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
 
         elif route == "/api/channels" or route.startswith("/api/channels/"):
             self._handle_channels_api(route)
+
+        elif route in ("/api/streams/delete-selected", "/api/streams/delete-stopped") and self.command == "POST":
+            self._handle_bulk_delete(route)
 
         elif self.path.startswith("/api/streams"):
             if self.command == "GET":
