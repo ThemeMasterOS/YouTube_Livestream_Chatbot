@@ -19,6 +19,8 @@ from zoneinfo import ZoneInfo
 from collections import deque
 from http.cookies import SimpleCookie
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from dotenv import load_dotenv
+load_dotenv()
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from auth import Authorize
@@ -2703,7 +2705,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
 
 
 def start_health_check_server():
-    port = int(os.getenv("PORT", 10000))
+    port = int(os.getenv("SERVER_PORT", 10000))
     server = ThreadingHTTPServer(('0.0.0.0', port), HealthCheckHandler)
     server.daemon_threads = True
     server.serve_forever()
