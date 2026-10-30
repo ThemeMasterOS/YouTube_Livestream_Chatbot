@@ -2173,6 +2173,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                     <tr><td><code>!random / !rand</code></td><td>Tells a random joke.</td></tr>
                     <tr><td><code>!chatmbr &lt;query&gt; / !ai &lt;query&gt;</code></td><td>Asks ChatMBR a question.</td></tr>
                     <tr><td><code>E</code></td><td>E</td></tr>
+                    <tr><td><code>!say &lt;text&gt;</code></td><td>Makes the bot repeat your text.</td></tr>
                     <tr><td><code>!commands / !help</code></td><td>Displays this command list page.</td></tr>
                     <tr><td><code>!coins</code></td><td>Shows your current NeilCoins balance.</td></tr>
                     <tr><td><code>!gamble &lt;number&gt;</code></td><td>Bets that many NeilCoins — 50/50 chance to double it or lose it.</td></tr>
@@ -3735,6 +3736,7 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
         lower_msg in ["hello", "hi", "hey", "!revertical", "!random", "!rand", "!commands", "!help", "e",
                       "!coins", "!resetcoins", "!leaderboard", "!quiz", "!angryrevertical"]
         or lower_msg.startswith(("!chatmbr", "!ai", "!gamble", "!giftpoint"))
+        or lower_msg == "!say" or lower_msg.startswith("!say ")
         or _is_quiz_answer_command(lower_msg)
     )
 
@@ -3803,6 +3805,26 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
 
     elif lower_msg in ["e"]:
         sendReplyToLiveChat(liveChatId, f"E", stream_name=stream_name)
+        return time.time()
+
+    # --- !say command (v0.2.8.1) ---
+    elif lower_msg == "!say" or lower_msg.startswith("!say "):
+        parts = message_text.split(maxsplit=1)   # keep the original casing
+        say_text = parts[1].strip() if len(parts) > 1 else ""
+
+        if not say_text:
+            sendReplyToLiveChat(liveChatId, f"{userName} Usage: !say <text>", stream_name=stream_name)
+            return time.time()
+
+        # Don't let the bot repeat anything on the global blocklist.
+        if check_blocklist_categories(load_moderation(), say_text.lower()) is not None:
+            add_log(f"!say from {userName} skipped in '{stream_name}': text matches the blocklist.")
+            return time.time()
+
+        if len(say_text) > 197:
+            say_text = say_text[:197] + "..."
+
+        sendReplyToLiveChat(liveChatId, say_text, stream_name=stream_name)
         return time.time()
 
     elif lower_msg.startswith(("!chatmbr", "!ai")):
