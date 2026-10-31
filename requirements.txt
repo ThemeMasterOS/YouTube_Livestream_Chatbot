@@ -2,6 +2,7 @@ google-api-python-client
 google-auth-oauthlib
 google-auth-httplib2
 python-dotenv
-pytchat
+# Credits to @Revertical-x1q for maintaining pytchat
+pytchat-ng
 httpx
 certifi>=2026.10.19
