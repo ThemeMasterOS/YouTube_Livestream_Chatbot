@@ -2,7 +2,6 @@ google-api-python-client
 google-auth-oauthlib
 google-auth-httplib2
 python-dotenv
-# Credits to @Revertical-x1q for maintaining pytchat
-pytchat-ng
+thememasterchat @ git+https://github.com/ThemeMasterOS/ThemeMasterChat.git@master
 httpx
 certifi>=2026.10.19
