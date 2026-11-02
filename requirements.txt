@@ -2,6 +2,6 @@ google-api-python-client
 google-auth-oauthlib
 google-auth-httplib2
 python-dotenv
-thememasterchat==0.1.0.1
+thememasterchat
 httpx
 certifi>=2026.10.19
