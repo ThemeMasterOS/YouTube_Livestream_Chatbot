@@ -13,7 +13,7 @@ Free to use, fork, and modify.
 - Listens to one or more YouTube live chats simultaneously
 - Custom chat commands (`!commands`, `!help`, `!leaderboard`, and more — fully customizable in `bot.py`)
 - `!ai` / `!chatmbr` command powered by an AI chat API (optional, requires separate setup — see `chat.js`)
-- Primary connection via [pytchat](https://github.com/taizan-hokuto/pytchat) (0 quota cost), with optional YouTube Data API fallback if pytchat fails
+- Primary connection via [ThemeMasterChat](https://github.com/ThemeMasterOS/ThemeMasterChat) (a pytchat fork, imported as `pytchat`) (0 quota cost), with optional YouTube Data API fallback if it fails
 - Web dashboard at `/live` to add, label, and manage streams
 - Automatic token refresh — no need to re-login every time you restart the bot
 
@@ -42,15 +42,15 @@ Free to use, fork, and modify.
    ```
 7. Open `http://localhost:10000/live` (or whatever port is shown in your terminal) to manage streams from the dashboard.
 
-For a more detailed, beginner-friendly walkthrough, see `How_To_Make_Your_Own_Bot.txt` in this repo.
+For a more detailed, beginner-friendly walkthrough, see `How to make your own bot.txt` in this repo.
 
 ---
 
 ## Optional: Backup API Fallback
 
-By default, the bot only needs **one** set of credentials (`client_secret.json` + `token.json`) to run. This is completely optional — if you don't configure them, the bot runs fine on pytchat alone.
+By default, the bot only needs **one** set of credentials (`client_secret.json` + `token.json`) to run. This is completely optional — if you don't configure them, the bot runs fine on ThemeMasterChat alone.
 
-Backups exist so that if pytchat has issues, the bot can fall back to the YouTube Data API using a **separate** Google Cloud project's quota, instead of eating into your main project's quota:
+Backups exist so that if ThemeMasterChat has issues, the bot can fall back to the YouTube Data API using a **separate** Google Cloud project's quota, instead of eating into your main project's quota:
 
 | Slot | Files needed | Required? |
 |---|---|---|
@@ -75,11 +75,13 @@ If any backup's files are missing, the bot detects this automatically at startup
 | File | Purpose |
 |---|---|
 | `bot.py` | Main bot — chat listening, commands, dashboard |
+| `bot v0.2.8.1 (Original pytchat).py` | Original pytchat version (not recommended because of Errno 11). For ThemeMasterChat, use `bot.py` instead. This version will not be updated. |
 | `auth.py` | Handles Google OAuth login and token refresh |
 | `token_generator.py` | Standalone script to generate `token.json` and backups |
-| `pytchat_oembed_patch.py` | Patch required for pytchat to keep working |
+| `pytchat_manual_channel_patch.py` | Lets you enter a channel ID manually if the automatic lookups fail. Required by `bot.py` |
+| `pytchat_oembed_patch.py` | Patch used by the original pytchat version only. Not needed by `bot.py` |
 | `requirements.txt` | Python dependencies |
-| `How_To_Make_Your_Own_Bot.txt` | Full beginner setup guide |
+| `How to make your own bot.txt` | Full beginner setup guide |
 
 ---
 
