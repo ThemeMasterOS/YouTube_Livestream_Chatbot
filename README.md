@@ -75,6 +75,7 @@ If any backup's files are missing, the bot detects this automatically at startup
 | File | Purpose |
 |---|---|
 | `bot.py` | Main bot — chat listening, commands, dashboard |
+| `bot initial release.py` | The initial release version (not recommended bcuz it'll waste ur quota faster) |
 | `bot v0.2.8.1 (Original pytchat).py` | Original pytchat version (not recommended: all streams share one connection, which often causes Errno 11). For ThemeMasterChat, use bot.py instead. This version will not be updated. |
 | `auth.py` | Handles Google OAuth login and token refresh |
 | `token_generator.py` | Standalone script to generate `token.json` and backups |
