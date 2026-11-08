@@ -77,6 +77,7 @@ If any backup's files are missing, the bot detects this automatically at startup
 | `bot.py` | Main bot — chat listening, commands, dashboard |
 | `bot initial release.py` | The initial release version (not recommended bcuz it'll waste ur quota faster) |
 | `bot v0.2.8.1 (Original pytchat).py` | Original pytchat version (not recommended: all streams share one connection, which often causes Errno 11). For ThemeMasterChat, use bot.py instead. This version will not be updated. |
+| `bot v0.2.8.2.py` | The last bot v0.2.x family. I added this in case if u miss the old layout |
 | `auth.py` | Handles Google OAuth login and token refresh |
 | `token_generator.py` | Standalone script to generate `token.json` and backups |
 | `pytchat_manual_channel_patch.py` | Lets you enter a channel ID manually if the automatic lookups fail. Required by `bot.py` |
