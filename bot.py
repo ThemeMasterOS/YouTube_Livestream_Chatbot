@@ -1040,7 +1040,7 @@ def get_logs_since(since_id):
 
 
 def get_leaderboard_rows():
-    """Top 50 users as plain dicts, shared by the /leaderboard page and /api/leaderboard."""
+    """Top 50 users as plain dicts for /api/leaderboard. Ranking uses the stored integers; "balance" is returned as a decimal string."""
     coins = load_coins()
     ranked = sorted(coins.values(), key=lambda r: r.get('balance', 0), reverse=True)[:50]
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
@@ -1048,7 +1048,7 @@ def get_leaderboard_rows():
         {
             "rank": medals.get(i, f"#{i}"),
             "name": r.get('name', 'Unknown'),
-            "balance": r.get('balance', 0),
+            "balance": str(r.get('balance', 0)),   # decimal string: JSON numbers above 2**53 lose digits in browsers
             "resets": f"{r.get('resetcoins_uses', 0)}/{RESETCOINS_MAX_USES}",
         }
         for i, r in enumerate(ranked, start=1)
@@ -1543,7 +1543,7 @@ CHANNEL_UI_JS = r"""
 # The shell is a plain (non-f) string; __BOOT__ becomes JSON (admin flag, commands, counts).
 # Live and Moderation are served as fragments (/_view/live, /_view/moderation) and run inside the shell.
 # ---------------------------------------------------------------------------
-BOT_VERSION = "0.3.0.0"
+BOT_VERSION = "0.3.0.1"
 BOT_STARTED_AT = time.time()
 DASHBOARD_PAGES = ("home", "commands", "leaderboard", "logs", "live", "moderation", "themes")
 
@@ -1680,11 +1680,16 @@ label.cell-label.ctl{display:block;position:absolute;width:1px;height:1px;margin
 .grid.stats{grid-template-columns:repeat(2,minmax(0,1fr))}
 .stat b{overflow-wrap:anywhere;font-size:22px}
 .stat span{overflow-wrap:anywhere}
+.stat b.up{font-size:22px;font-variant-numeric:tabular-nums;overflow-wrap:normal}
+.nw{white-space:nowrap}
+.lb td.usr{overflow-wrap:break-word}
+.lb td.bal{overflow-wrap:normal;word-break:keep-all}
+@media (max-width:640px){ .lbcard{padding:10px} .lb th,.lb td{padding:8px 4px} .lb td{font-size:14px} .lb th{font-size:11px;letter-spacing:.03em} }
 @container (min-width:640px){
   .grid.stats{grid-template-columns:repeat(4,minmax(0,1fr))}
   .stat b{font-size:28px;font-size:clamp(22px,3.6cqi,28px)}
 }
-@container (max-width:639px){ .stat b{font-size:clamp(20px,7cqi,24px)} }
+@container (max-width:639px){ .stat b{font-size:clamp(20px,7cqi,24px)} .stat b.up{font-size:16px} }
 @media (max-width:820px){
   nav{position:relative;scroll-padding-inline:12px;-webkit-overflow-scrolling:touch}
   nav a{flex:0 0 auto}
@@ -1792,7 +1797,31 @@ __CHANNEL_CSS__
   function getJson(url) { return fetch(url, { cache: 'no-store' }).then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); }); }
   function href(k) { return (boot.notFound ? '/' : '') + '#/' + k; }
   function head(t, s) { return '<h1>' + t + '</h1><p class="sub">' + s + '</p>'; }
-  function uptime(sec) { sec = Math.max(0, Math.floor(sec)); return Math.floor(sec / 86400) + ' d ' + pad(Math.floor(sec % 86400 / 3600)) + ':' + pad(Math.floor(sec % 3600 / 60)); }
+  function fmtBig(v) {          /* thousands separators on the decimal string itself: no Number(), parseInt() or unary + */
+    var m = /^(-?)(\d+)$/.exec(String(v));
+    if (!m) return String(v);
+    var d = m[2].replace(/^0+(?=\d)/, '');
+    return (d === '0' ? '' : m[1]) + d.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  }
+  var loadedAt = Date.now();      /* uptime = server uptime when the page was built + time elapsed here, so the device's own clock offset or timezone does not matter */
+  function tickUptime() {
+    var a = $('upA'), b = $('upB'); if (!a || !b) return;
+    if (boot.startedAt == null || boot.serverNow == null) { a.textContent = '–'; b.textContent = ''; return; }
+    var s = Math.floor(Math.max(0, boot.serverNow - boot.startedAt + (Date.now() - loadedAt) / 1000));
+    a.textContent = Math.floor(s / 86400) + 'd ' + Math.floor(s % 86400 / 3600) + 'h';
+    b.textContent = Math.floor(s % 3600 / 60) + 'm ' + (s % 60) + 's';
+  }
+  /* text with invisible line-break opportunities after each delimiter (a capturing group); textContent stays identical */
+  function softWrap(td, text, delim, longRun) {
+    String(text).split(delim).forEach(function (p, i) {
+      if (!p) return;
+      if (i % 2 === 0 && longRun && Array.from(p).length > longRun) {      /* very long unbroken token: last-resort break opportunity every 6 characters */
+        var cps = Array.from(p);
+        for (var k = 0; k < cps.length; k += 6) { if (k) td.appendChild(document.createElement('wbr')); td.appendChild(document.createTextNode(cps.slice(k, k + 6).join(''))); }
+      } else td.appendChild(document.createTextNode(p));
+      if (i % 2 === 1) td.appendChild(document.createElement('wbr'));
+    });
+  }
 
   /* ---------- router ---------- */
   var ROUTES = {
@@ -1888,9 +1917,12 @@ __CHANNEL_CSS__
   function renderHome() {
     var n = boot.listening || 0;
     view.innerHTML = '<div class="hero"><h1>Welcome back, Theme Master</h1><p class="sub" style="margin:0"><span class="dot"></span>Bot online · listening to ' + n + ' stream' + (n === 1 ? '' : 's') + '</p></div>' +
-      '<div class="statsbox"><div class="grid stats"><div class="stat"><b>' + n + '</b><span>Streams listening</span></div><div class="stat"><b>' + (boot.commands || []).length + '</b><span>Chat commands</span></div><div class="stat"><b>' + (boot.users == null ? '–' : Number(boot.users).toLocaleString('en-US')) + '</b><span>Users with NeilCoins</span></div><div class="stat"><b>' + uptime(Date.now() / 1000 - boot.startedAt) + '</b><span>Uptime</span></div></div></div>' +
+      '<div class="statsbox"><div class="grid stats"><div class="stat"><b>' + n + '</b><span>Streams listening</span></div><div class="stat"><b>' + (boot.commands || []).length + '</b><span>Chat commands</span></div><div class="stat"><b>' + (boot.users == null ? '–' : Number(boot.users).toLocaleString('en-US')) + '</b><span>Users with NeilCoins</span></div><div class="stat"><b class="up" id="uptime" role="timer"><span class="nw" id="upA"></span> <span class="nw" id="upB"></span></b><span>Uptime</span></div></div></div>' +
       '<div class="card"><h3>Jump to</h3><div class="row">' + Object.keys(ROUTES).filter(function (k) { return k !== 'home'; }).map(function (k) { return '<a class="btn" href="' + href(k) + '">' + ROUTES[k][0] + ' ' + ROUTES[k][1] + '</a>'; }).join('') + '</div></div>' +
       '<div class="card"><h3>Latest activity</h3><div class="mono" id="act" style="font-size:13px">Loading…</div></div>';
+    tickUptime();
+    var upT = setInterval(tickUptime, 1000);
+    cleanups.push(function () { clearInterval(upT); });
     getJson('/api/logs?since=0').then(function (d) {
       var a = $('act'); if (!a) return;
       a.innerHTML = d.entries.slice(-4).map(function (e) { return '<div class="act">' + logHtml(e.text) + '</div>'; }).join('') || 'No chat activity logged yet.';
@@ -1905,14 +1937,19 @@ __CHANNEL_CSS__
 
   function renderBoard() {
     view.innerHTML = head('🏆 NeilCoins Leaderboard', '<span id="cnt"></span> user(s) shown. New viewers start with ' + esc(boot.startCoins) + ' NeilCoins. Updates every 30 seconds <span id="chk"></span>') +
-      '<div class="card tablewrap"><table><thead><tr><th>Rank</th><th>User</th><th>NeilCoins</th><th>Resets used</th></tr></thead><tbody id="lbody"><tr><td colspan="4">Loading…</td></tr></tbody></table></div>';
+      '<div class="card tablewrap lbcard"><table class="lb"><thead><tr><th>Rank</th><th>User</th><th>NeilCoins</th><th>Resets used</th></tr></thead><tbody id="lbody"><tr><td colspan="4">Loading…</td></tr></tbody></table></div>';
     function load() {
       getJson('/api/leaderboard').then(function (d) {
         var tb = $('lbody'); if (!tb) return;
         tb.textContent = '';
         d.rows.forEach(function (r) {
           var tr = document.createElement('tr');
-          [r.rank, r.name, Number(r.balance).toLocaleString('en-US'), r.resets].forEach(function (v) { var td = document.createElement('td'); td.textContent = v; tr.appendChild(td); });
+          [[r.rank], [r.name, /([_\-. ]+)/, 'usr', 10], [fmtBig(r.balance), /(,)/, 'bal'], [r.resets]].forEach(function (c) {
+            var td = document.createElement('td');
+            if (c[2]) td.className = c[2];
+            if (c[1]) softWrap(td, c[0], c[1], c[3]); else td.textContent = c[0];
+            tr.appendChild(td);
+          });
           tb.appendChild(tr);
         });
         if (!d.rows.length) { tb.innerHTML = '<tr><td colspan="4">No NeilCoins data yet.</td></tr>'; }
@@ -2221,7 +2258,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             listening = len(active_stream_ids)
         users = _cached_user_count()
         boot = {
-            "version": BOT_VERSION, "admin": self._is_admin(), "startedAt": BOT_STARTED_AT,
+            "version": BOT_VERSION, "admin": self._is_admin(), "startedAt": BOT_STARTED_AT, "serverNow": time.time(),
             "commands": DASHBOARD_COMMANDS, "startCoins": DEFAULT_STARTING_COINS,
             "listening": listening, "users": users, "legacy": legacy, "notFound": status == 404,
         }
