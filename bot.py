@@ -1527,7 +1527,7 @@ CHANNEL_UI_JS = r"""
                     body: JSON.stringify({ video_id: videoId, channel_id: id })
                 }).then(function (r) { return r.json(); }).then(function (data) {
                     alert(data.message);
-                    location.reload();
+                    if (window.__refreshView) window.__refreshView('live'); else location.reload();
                 }).catch(function (e) { alert('Error: ' + e); });
             }
         });
@@ -1543,7 +1543,7 @@ CHANNEL_UI_JS = r"""
 # The shell is a plain (non-f) string; __BOOT__ becomes JSON (admin flag, commands, counts).
 # Live and Moderation are served as fragments (/_view/live, /_view/moderation) and run inside the shell.
 # ---------------------------------------------------------------------------
-BOT_VERSION = "0.3.0.1"
+BOT_VERSION = "0.3.0.2"
 BOT_STARTED_AT = time.time()
 DASHBOARD_PAGES = ("home", "commands", "leaderboard", "logs", "live", "moderation", "themes")
 
@@ -1618,6 +1618,8 @@ nav a.on{background:var(--accent);color:var(--accent-ink)}
 main{padding:28px clamp(16px,4vw,40px) 60px;max-width:1100px;width:100%}
 h1{font-size:26px;margin:0 0 4px;letter-spacing:-.02em}
 .sub{color:var(--muted);margin:0 0 22px}
+#view.refreshing{opacity:.45;transition:opacity .15s}
+.rf-badge{position:fixed;top:14px;left:50%;transform:translateX(-50%);z-index:60;background:var(--surface);color:var(--ink);border:1px solid var(--line);border-radius:999px;padding:6px 16px;font-size:13px;box-shadow:var(--shadow)}
 .card{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:18px;box-shadow:var(--shadow);margin-bottom:16px}
 .card h3{margin:0 0 10px;font-size:15px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:16px}
@@ -1836,7 +1838,7 @@ __CHANNEL_CSS__
   function current() { return location.hash.replace(/^#\/?/, '').split('?')[0].replace(/\/+$/, '').toLowerCase() || 'home'; }
 
   function render() {
-    cleanups.forEach(function (fn) { try { fn(); } catch (e) {} }); cleanups = []; navTok++;
+    cleanups.forEach(function (fn) { try { fn(); } catch (e) {} }); cleanups = []; navTok++; endSoft();
     var k = boot.notFound ? '' : current();
     document.querySelectorAll('#nav a').forEach(function (a) {
       var on = a.dataset.r === k; a.classList.toggle('on', on);
@@ -2022,21 +2024,41 @@ __CHANNEL_CSS__
       added.forEach(function (n) { if (n.parentNode) n.parentNode.removeChild(n); });
     });
   }
-  function loadFragment(name) {
-    var tok = navTok;
-    view.innerHTML = '<p class="sub">Loading…</p>';
+  /* Soft refresh (v0.3.0.2): keeps the old content on screen (dimmed, not clickable) with a Loading badge,
+     swaps in the fresh fragment, and restores the scroll position. Nothing reloads the page. */
+  function endSoft() {
+    view.classList.remove('refreshing'); view.removeAttribute('inert'); view.removeAttribute('aria-busy');
+    var b = $('rfBadge'); if (b && b.parentNode) b.parentNode.removeChild(b);
+  }
+  function loadFragment(name, soft) {
+    var tok = navTok, keepY = window.scrollY;
+    if (soft) {
+      view.classList.add('refreshing'); view.setAttribute('inert', ''); view.setAttribute('aria-busy', 'true');
+      var badge = document.createElement('div'); badge.id = 'rfBadge'; badge.className = 'rf-badge'; badge.setAttribute('role', 'status'); badge.textContent = 'Loading…';
+      document.body.appendChild(badge);
+    } else {
+      view.innerHTML = '<p class="sub">Loading…</p>';
+    }
     fetch('/_view/' + name, { cache: 'no-store' }).then(function (r) { if (!r.ok) throw new Error(r.status); return r.text(); }).then(function (html) {
       if (tok !== navTok) return;
       var tpl = document.createElement('template'); tpl.innerHTML = html;
       var codes = Array.prototype.slice.call(tpl.content.querySelectorAll('script')).map(function (s) { var c = s.textContent; s.parentNode.removeChild(s); return c; });
       view.innerHTML = ''; view.appendChild(tpl.content);
+      endSoft();
       runScripts(codes); applyLock();
+      if (soft) window.scrollTo(0, keepY);
     }).catch(function () {
       if (tok !== navTok) return;
+      if (soft) { endSoft(); toast('Could not refresh. Check your connection and reload the page.', 4000); return; }
       view.innerHTML = '<div class="card"><h3>Could not load this page</h3><p class="sub">Check your connection and try again.</p><button type="button" id="retry">Retry</button></div>';
       $('retry').addEventListener('click', render);
     });
   }
+  /* Called by the Live / Moderation fragments after an add, edit or remove. Only refreshes if that tab is still open. */
+  window.__refreshView = function (name) {
+    if (boot.notFound || !FRAG[name] || current() !== name) return;
+    loadFragment(name, true);
+  };
 
   function renderThemes() {
     var cur = document.documentElement.getAttribute('data-theme');
@@ -2414,13 +2436,17 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                             body: JSON.stringify(body)
                         }}).then(r => r.json()).then(data => {{
                             alert(data.message);
-                            location.reload();
+                            refreshLive();
                         }}).catch(e => alert('Error: ' + e));
                     }}
 
                     const CHANNEL_ID_HELP = 'That is not a valid channel ID. It should start with UC and be 24 characters long.';
                     function isValidChannelId(value) {{
                         return /^UC[0-9A-Za-z_-]{{22}}$/.test(value);
+                    }}
+
+                    function refreshLive() {{
+                        if (window.__refreshView) window.__refreshView('live'); else location.reload();
                     }}
 
                     function editLabel(videoId, currentLabel) {{
@@ -2433,7 +2459,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                             headers: {{'Content-Type': 'application/json'}},
                             body: JSON.stringify({{video_id: videoId, label: newLabel}})
                         }}).then(r => r.json()).then(data => {{
-                            location.reload();
+                            refreshLive();
                         }}).catch(e => alert('Error: ' + e));
                     }}
 
@@ -2471,7 +2497,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                         }}).then(r => r.json())
                           .then(data => {{
                               alert(data.message);
-                              location.reload();
+                              refreshLive();
                           }})
                           .catch(e => alert('Error: ' + e));
                     }}
@@ -2497,7 +2523,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                             .then(r => r.json())
                             .then(data => {{
                                 alert(data.message);
-                                location.reload();
+                                refreshLive();
                             }})
                             .catch(e => alert('Error: ' + e));
                     }}
@@ -2553,7 +2579,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                                 completed++;
                                 if (completed === videoIds.length) {{
                                     alert(`Restored ${{videoIds.length}} stream(s)!`);
-                                    location.reload();
+                                    refreshLive();
                                 }}
                             }});
                         }});
@@ -2678,8 +2704,12 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                             body: JSON.stringify({{action: 'create'}})
                         }}).then(r => r.json()).then(data => {{
                             alert(data.message);
-                            location.reload();
+                            refreshModeration();
                         }});
+                    }}
+
+                    function refreshModeration() {{
+                        if (window.__refreshView) window.__refreshView('moderation'); else location.reload();
                     }}
 
                     function saveBlocklistCategory(catId) {{
@@ -2710,7 +2740,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                             body: JSON.stringify({{action: 'delete', category_id: catId}})
                         }}).then(r => r.json()).then(data => {{
                             alert(data.message);
-                            location.reload();
+                            refreshModeration();
                         }});
                     }}
 
