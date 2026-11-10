@@ -936,6 +936,32 @@ def _clear_pytchat_retry_request(video_id):
         _force_pytchat_retry.discard(video_id)
 
 
+# v0.3.0.3: live label registry. A listener thread used to keep the label it was started with
+# for its whole life, so renaming a stream on /live never reached the running thread's logs.
+# The thread now re-reads its label from here, and a rename updates it.
+stream_labels = {}
+stream_labels_lock = threading.Lock()
+
+
+def set_stream_label(video_id, label):
+    """Record the current display label for a stream (blank falls back to the video ID on read)."""
+    with stream_labels_lock:
+        stream_labels[video_id] = (label or "").strip()
+
+
+def get_stream_label(video_id, fallback=None):
+    """Current display label for a stream: the registry value, else fallback, else the video ID."""
+    with stream_labels_lock:
+        label = stream_labels.get(video_id)
+    return label or fallback or video_id
+
+
+def is_stream_running(video_id):
+    """True if a listener thread is currently registered for this video ID."""
+    with active_streams_lock:
+        return video_id in active_stream_ids
+
+
 def start_stream_listener(video_id, label):
     """Start a listener thread for a video ID if one isn't already running."""
     with active_streams_lock:
@@ -944,6 +970,7 @@ def start_stream_listener(video_id, label):
             return False
         active_stream_ids.add(video_id)
         stop_flags[video_id] = threading.Event()
+    set_stream_label(video_id, label)
 
     thread = threading.Thread(
         target=listen_to_stream,
@@ -962,6 +989,8 @@ def stop_stream_listener(video_id):
             flag.set()
         active_stream_ids.discard(video_id)
         stop_flags.pop(video_id, None)
+    with stream_labels_lock:
+        stream_labels.pop(video_id, None)
 
 
 def mark_stream_stopped(video_id):
@@ -1543,7 +1572,7 @@ CHANNEL_UI_JS = r"""
 # The shell is a plain (non-f) string; __BOOT__ becomes JSON (admin flag, commands, counts).
 # Live and Moderation are served as fragments (/_view/live, /_view/moderation) and run inside the shell.
 # ---------------------------------------------------------------------------
-BOT_VERSION = "0.3.0.2"
+BOT_VERSION = "0.3.0.3"
 BOT_STARTED_AT = time.time()
 DASHBOARD_PAGES = ("home", "commands", "leaderboard", "logs", "live", "moderation", "themes")
 
@@ -2887,7 +2916,17 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                 pytchat_manual_channel_patch.set_manual_channel_id(video_id, record.get('channel_id'))
 
                 channel_changed = has_channel_field and channel_id != old_channel_id
-                started = start_stream_listener(video_id, label or video_id)
+                old_label = existing.get('label', '')
+                label_changed = has_label_field and label != old_label
+                if is_stream_running(video_id):
+                    # Already listening: never go through start_stream_listener (its "duplicate start" log
+                    # is misleading for an edit). Just push the new label to the running thread.
+                    started = False
+                    if label_changed:
+                        set_stream_label(video_id, label or video_id)
+                        add_log(f"Renamed '{old_label or video_id}' → '{label or video_id}' ({video_id})")
+                else:
+                    started = start_stream_listener(video_id, label or video_id)
                 if started:
                     self.wfile.write(json.dumps({
                         "message": f"Started listening to '{label or video_id}'! Check /logs to confirm connection."
@@ -2902,6 +2941,10 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                 elif channel_changed:
                     self.wfile.write(json.dumps({
                         "message": f"Channel ID removed for '{label or video_id}'."
+                    }).encode("utf-8"))
+                elif label_changed:
+                    self.wfile.write(json.dumps({
+                        "message": f"Label updated to '{label or video_id}'."
                     }).encode("utf-8"))
                 else:
                     self.wfile.write(json.dumps({
@@ -4226,6 +4269,7 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
         use_api_fallback = True
 
     while not stop_flag.is_set():
+        stream_name = get_stream_label(stream_id, stream_name)  # v0.3.0.3: pick up renames from /live
         try:
             current_time = time.time()
 
