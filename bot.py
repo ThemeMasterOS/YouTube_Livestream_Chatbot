@@ -3921,7 +3921,7 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
         return time.time()
 
     elif lower_msg in ["!commands", "!help"]:
-        cmd_url = "http://217.154.36.84:8011/commands"
+        cmd_url = "https://youtube-livestream-chatbot.onrender.com/commands"
         sendReplyToLiveChat(liveChatId, f"{userName} -> The bot commands are available at {cmd_url}", stream_name=stream_name)
         return time.time()
 
@@ -4135,7 +4135,7 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
         return time.time()
 
     elif lower_msg == "!leaderboard":
-        theme_master = "http://217.154.36.84:8011/leaderboard"
+        theme_master = "https://youtube-livestream-chatbot.onrender.com/leaderboard"
         sendReplyToLiveChat(liveChatId, f"{userName} -> The leaderboard is available at {theme_master}", stream_name=stream_name)
         return time.time()
 
