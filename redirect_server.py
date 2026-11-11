@@ -1,8 +1,10 @@
+import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-HOST = "127.0.0.1"
-PORT = 10000
-TARGET = "http://217.154.36.84:8011/"
+# Render requires binding to 0.0.0.0 and the PORT env var it provides
+HOST = "0.0.0.0"
+PORT = int(os.environ.get("PORT", 10000))
+TARGET = os.environ.get("TARGET", "http://217.154.36.84:8011")
 
 
 class RedirectHandler(BaseHTTPRequestHandler):
@@ -27,7 +29,7 @@ class RedirectHandler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     server = HTTPServer((HOST, PORT), RedirectHandler)
-    print(f"Redirecting http://{HOST}:{PORT} -> {TARGET} (Ctrl+C to stop)")
+    print(f"Redirecting port {PORT} -> {TARGET} (Ctrl+C to stop)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
