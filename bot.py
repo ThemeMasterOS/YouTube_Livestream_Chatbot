@@ -1572,7 +1572,7 @@ CHANNEL_UI_JS = r"""
 # The shell is a plain (non-f) string; __BOOT__ becomes JSON (admin flag, commands, counts).
 # Live and Moderation are served as fragments (/_view/live, /_view/moderation) and run inside the shell.
 # ---------------------------------------------------------------------------
-BOT_VERSION = "0.3.0.3"
+BOT_VERSION = "0.3.1.0"
 BOT_STARTED_AT = time.time()
 DASHBOARD_PAGES = ("home", "commands", "leaderboard", "logs", "live", "moderation", "themes")
 
@@ -1602,16 +1602,48 @@ DASHBOARD_SHELL_HTML = (r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>ThemeMasterBot</title>
+<meta name="theme-color" content="#f4f1ea">
 <script>
-/* Apply saved theme before first paint (no flash). Light is the default. */
+/* Theme engine (v0.3.1.0). Modes: system (default) | light | dark | black.
+   <html data-theme> always holds the RESOLVED theme (light | dark | black), so all CSS keeps working.
+   Runs before first paint (no flash) and follows the phone's light/dark setting live while mode is "system". */
 (function () {
-  var t = 'light';
-  try { var s = localStorage.getItem('tmb-theme'); if (s === 'dark' || s === 'light') t = s; } catch (e) {}
-  document.documentElement.setAttribute('data-theme', t);
+  var KEY = 'tmb-theme-mode', BKEY = 'tmb-system-black', MODES = ['system', 'light', 'dark', 'black'];
+  var BAR = { light: '#f4f1ea', dark: '#11141b', black: '#000000' };
+  var mq = null; try { mq = window.matchMedia('(prefers-color-scheme: dark)'); } catch (e) {}
+  function load(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+  function save(k, v) { try { localStorage.setItem(k, v); return true; } catch (e) { return false; } }
+  var st = { mode: 'system', sysBlack: false };
+  var m = load(KEY); if (MODES.indexOf(m) > -1) st.mode = m;
+  st.sysBlack = load(BKEY) === '1';
+  function phoneDark() { return !!(mq && mq.matches); }
+  function resolve() {
+    if (st.mode !== 'system') return st.mode;
+    if (!phoneDark()) return 'light';
+    return st.sysBlack ? 'black' : 'dark';
+  }
+  function apply() {
+    var t = resolve();
+    document.documentElement.setAttribute('data-theme', t);
+    var meta = document.querySelector('meta[name="theme-color"]'); if (meta) meta.setAttribute('content', BAR[t]);
+    try { document.dispatchEvent(new Event('tmb-theme-change')); } catch (e) {}
+    return t;
+  }
+  if (mq) {
+    var onPhone = function () { if (st.mode === 'system') apply(); };
+    if (mq.addEventListener) mq.addEventListener('change', onPhone); else if (mq.addListener) mq.addListener(onPhone);
+  }
+  window.__tmbTheme = {
+    state: st, resolve: resolve, phoneDark: phoneDark, apply: apply,
+    setMode: function (v) { if (MODES.indexOf(v) < 0) v = 'system'; st.mode = v; var ok = save(KEY, v); apply(); return ok; },
+    setSysBlack: function (on) { st.sysBlack = !!on; var ok = save(BKEY, on ? '1' : '0'); apply(); return ok; }
+  };
+  apply();
 })();
 </script>
 <style>
 :root{--bg:#f4f1ea;--surface:#fffdf9;--surface2:#efeae0;--ink:#1f2430;--muted:#6a6f7b;--line:#ddd6c8;--accent:#b4440b;--accent-ink:#fff;--ok:#2d7a46;--warn:#a86a00;--bad:#b42318;--term:#faf8f3;--shadow:0 1px 2px rgba(31,36,48,.06),0 6px 18px rgba(31,36,48,.05);color-scheme:light}
+:root[data-theme="black"]{--bg:#000000;--surface:#0b0b0b;--surface2:#161616;--ink:#ebe8e1;--muted:#8d94a3;--line:#262626;--accent:#f0913a;--accent-ink:#1a1206;--ok:#4cc27a;--warn:#e2a23b;--bad:#f2766b;--term:#050505;--shadow:0 1px 2px rgba(0,0,0,.6),0 6px 18px rgba(0,0,0,.5);color-scheme:dark}
 :root[data-theme="dark"]{--bg:#11141b;--surface:#1a1f2a;--surface2:#232a38;--ink:#ebe8e1;--muted:#98a0b0;--line:#2c3445;--accent:#f0913a;--accent-ink:#1a1206;--ok:#4cc27a;--warn:#e2a23b;--bad:#f2766b;--term:#0d1016;--shadow:0 1px 2px rgba(0,0,0,.3),0 6px 18px rgba(0,0,0,.25);color-scheme:dark}
 *{box-sizing:border-box}
 html,body{margin:0;height:100%}
@@ -1668,7 +1700,11 @@ label.f{display:block;font-size:13px;color:var(--muted);margin:10px 0 4px}
 .term div{padding:3px 0;border-bottom:1px solid var(--line);word-break:break-word}
 .term .t{color:var(--muted)}
 .lockbar{background:var(--surface2);border:1px dashed var(--line);border-radius:10px;padding:9px 12px;font-size:13px;margin-bottom:14px}
-.themes{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(240px,100%),1fr));gap:16px}
+.themes{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(160px,100%),1fr));gap:16px}
+.tnote{color:var(--muted);margin:14px 0 0}
+.tcheck{display:flex;align-items:flex-start;gap:10px;margin-top:14px;padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:var(--surface);cursor:pointer}
+.tcheck input{width:20px;height:20px;margin:2px 0 0;accent-color:var(--accent);flex:none}
+.tcheck small{display:block;color:var(--muted)}
 .tcard{border:2px solid var(--line);border-radius:14px;padding:14px;background:var(--surface);text-align:left;display:block;width:100%}
 .tcard.sel{border-color:var(--accent)}
 .swatch{border-radius:10px;height:92px;margin-bottom:10px;padding:10px;display:flex;flex-direction:column;gap:6px;border:1px solid #8884}
@@ -2090,17 +2126,34 @@ __CHANNEL_CSS__
   };
 
   function renderThemes() {
-    var cur = document.documentElement.getAttribute('data-theme');
-    function card(id, name, bg, ink, ac) { return '<button type="button" class="tcard' + (cur === id ? ' sel' : '') + '" data-th="' + id + '"><div class="swatch" style="background:' + bg + '"><i style="background:' + ink + ';width:60%"></i><i style="background:' + ink + ';opacity:.5;width:80%"></i><i style="background:' + ac + ';width:30%"></i></div><b>' + name + '</b> ' + (cur === id ? '✓ Active' : '') + (id === 'light' ? ' <span style="color:var(--muted);font-size:12px">(default)</span>' : '') + '</button>'; }
+    var T = window.__tmbTheme, st = T.state;
+    var names = { light: 'Light', dark: 'Dark', black: 'Black' };
+    function card(id, name, bg, ink, ac) {
+      var sel = st.mode === id;
+      return '<button type="button" class="tcard' + (sel ? ' sel' : '') + '" data-th="' + id + '"><div class="swatch" style="background:' + bg + '"><i style="background:' + ink + ';width:60%"></i><i style="background:' + ink + ';opacity:.5;width:80%"></i><i style="background:' + ac + ';width:30%"></i></div><b>' + name + '</b> ' + (sel ? '✓ Active' : '') + (id === 'system' ? ' <span style="color:var(--muted);font-size:12px">(default)</span>' : '') + '</button>';
+    }
+    var sysBg = 'linear-gradient(90deg,#f4f1ea 50%,' + (st.sysBlack ? '#000000' : '#11141b') + ' 50%)';
+    var note = st.mode === 'system'
+      ? 'Following your phone: ' + names[T.resolve()] + '.'
+      : 'Fixed theme: ' + names[T.resolve()] + ' (not following your phone).';
     view.innerHTML = head('🎨 Themes', 'Your choice is saved in this browser and applies to every page.') +
-      '<div class="themes">' + card('light', '☀️ Light', '#f4f1ea', '#1f2430', '#b4440b') + card('dark', '🌙 Dark', '#11141b', '#ebe8e1', '#f0913a') + '</div>';
+      '<div class="themes">' + card('system', '🖥️ System', sysBg, '#888888', '#d9742a') + card('light', '☀️ Light', '#f4f1ea', '#1f2430', '#b4440b') + card('dark', '🌙 Dark', '#11141b', '#ebe8e1', '#f0913a') + card('black', '⚫ Black', '#000000', '#ebe8e1', '#f0913a') + '</div>' +
+      '<p class="tnote" id="tnote">' + note + '</p>' +
+      '<label class="tcheck"><input type="checkbox" id="sysBlack"' + (st.sysBlack ? ' checked' : '') + '><span>When System is dark, use Black instead of Dark<small>Only applies while System is selected. Black turns AMOLED pixels off.</small></span></label>';
     view.querySelectorAll('[data-th]').forEach(function (b) {
       b.addEventListener('click', function () {
-        var t = b.dataset.th; document.documentElement.setAttribute('data-theme', t);
-        try { localStorage.setItem('tmb-theme', t); } catch (e) { toast('Theme applied for this session only (browser storage unavailable).'); }
+        if (!T.setMode(b.dataset.th)) toast('Theme applied for this session only (browser storage unavailable).');
         renderThemes();
       });
     });
+    $('sysBlack').addEventListener('change', function (e) {
+      if (!T.setSysBlack(e.target.checked)) toast('Theme applied for this session only (browser storage unavailable).');
+      renderThemes();
+    });
+    /* While this tab is open, refresh the note if the phone flips between light and dark. */
+    var onChange = function () { var n = $('tnote'); if (n && st.mode === 'system') n.textContent = 'Following your phone: ' + names[T.resolve()] + '.'; };
+    document.addEventListener('tmb-theme-change', onChange);
+    cleanups.push(function () { document.removeEventListener('tmb-theme-change', onChange); });
   }
 
   function render404() {
@@ -3921,7 +3974,7 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
         return time.time()
 
     elif lower_msg in ["!commands", "!help"]:
-        cmd_url = "https://youtube-livestream-chatbot.onrender.com/commands"
+        cmd_url = "http://217.154.36.84:8011/commands"
         sendReplyToLiveChat(liveChatId, f"{userName} -> The bot commands are available at {cmd_url}", stream_name=stream_name)
         return time.time()
 
@@ -4135,7 +4188,7 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
         return time.time()
 
     elif lower_msg == "!leaderboard":
-        theme_master = "https://youtube-livestream-chatbot.onrender.com/leaderboard"
+        theme_master = "http://217.154.36.84:8011/leaderboard"
         sendReplyToLiveChat(liveChatId, f"{userName} -> The leaderboard is available at {theme_master}", stream_name=stream_name)
         return time.time()
 
