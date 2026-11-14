@@ -1572,7 +1572,7 @@ CHANNEL_UI_JS = r"""
 # The shell is a plain (non-f) string; __BOOT__ becomes JSON (admin flag, commands, counts).
 # Live and Moderation are served as fragments (/_view/live, /_view/moderation) and run inside the shell.
 # ---------------------------------------------------------------------------
-BOT_VERSION = "0.3.1.0"
+BOT_VERSION = "0.3.1.1"
 BOT_STARTED_AT = time.time()
 DASHBOARD_PAGES = ("home", "commands", "leaderboard", "logs", "live", "moderation", "themes")
 
@@ -1602,6 +1602,9 @@ DASHBOARD_SHELL_HTML = (r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>ThemeMasterBot</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg?v=__VERSION__">
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png?v=__VERSION__">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png?v=__VERSION__">
 <meta name="theme-color" content="#f4f1ea">
 <script>
 /* Theme engine (v0.3.1.0). Modes: system (default) | light | dark | black.
@@ -2166,6 +2169,27 @@ __CHANNEL_CSS__
 </body>
 </html>
 """).replace("__CHANNEL_CSS__", _theme_css(CHANNEL_UI_CSS)).replace("__VERSION__", BOT_VERSION)
+
+
+# ---------------------------------------------------------------------------
+# v0.3.1.1: tab icon (favicon). Same orange rounded square + dark "T" as the dashboard header logo.
+# The T is drawn as shapes (not text) so it looks identical on every device. PNGs are embedded as base64.
+# ---------------------------------------------------------------------------
+FAVICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
+    '<rect width="64" height="64" rx="19" fill="#f0913a"/>'
+    '<rect x="16" y="17" width="32" height="9" fill="#1a1206"/>'
+    '<rect x="27" y="17" width="10" height="31" fill="#1a1206"/>'
+    '</svg>'
+).encode("utf-8")
+FAVICON_PNG_32 = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAADLklEQVR42u1XTWhcVRT+vvPum8nMvJlkYlpLEYVG3LQKbgSzkeBCXQS7aRdddVUQCq5cWtu1CA0UirhxbVeSlaCIP9h96dZCsVBBmkwz/+/ee46LyaTJOGaSiTKbHrib93PPd77znXPuJXbMDCRhANBYX1kuOrkcTNegPKOwzAzEEYyECdiC2ANH2egH/Xrh499+H/XFvQ/ss3dc50S4LsRHBSeLeTD4qFDDVCYE0kRQcEQedFMNt8t/ueu88VMY+qQZCAJ/fv5GuTpX/baSuXebrYAYNQIU8miRj5oZDDBNEkmqmUO7FX5o9pofnvrkXgcG0L65kGDrgWx3C9/VsnR1qxk8CXdcx+OAmCHUqy7dbvkfa6X8PdTPqPDindjoFq/V5gurjZbPRZD+1853NEERpI2Wz2vzhdVGt3iNF+9Ebt56+5Uk8n4iKPsI/h/OR5lIE1hUdGJi5xwjrlTnkqzRDVFIGf0hqsGO4TCR/RGRYB5NF0oue9oLVxzBtX4wI8kxtGGxkh4r4mYvIo7UMEn2gxnBNQdg2Ucl8ewbMyARoJsrvvr1Ebp5hAgxDRWX3jqJE1kKHw3DEAmIjwoAy45EeVydC4meV3zx/SM8aXukCWFTAHj/bB2nawXkcT8LagCJsjtoUxJ4oZKCwNQAkmHLGy9IuEkbBDUEHdA3DYBJvwhmbGysr4wFSQDRDH9s5Yg7DEQ1LJQcvvz5MW7/8hj18oDAp52A828u4dMPXsZ2L0D2FNRL9SIK7t/T5w6iTki8drI0UK8BXg1ZlmIpS3dLywCoGeZLDq+eLqPdDnDyDEA/6oGpm6iBrtd9eijnOiipMVqJuaLrFckeADKhr04EsHcD4WCR41M2fC9HaOYzF+FzAM8BCDk75yQgZugIZxE5YIYOG+sr94pOzvWCGiekxHam22bb40nb7zacqIZayeHFanqoI7wBOueE/aD3ncE2io6vd70pJ+RjOB+WshSn5gu7LXY4J3w83Lg0Mys6Si/YxlSHUrN/jllifIecdCiVxat3H6rhZiVLBTB/aPGMrMOL2XwlS0UNNxev3n0484vJ7K9mM7+czvp6/jc2/egqvaJ1cAAAAABJRU5ErkJggg==")
+APPLE_TOUCH_ICON_PNG_180 = base64.b64decode("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")
+ICON_ROUTES = {
+    "/favicon.svg": (FAVICON_SVG, "image/svg+xml"),
+    "/favicon.ico": (FAVICON_PNG_32, "image/png"),
+    "/favicon-32.png": (FAVICON_PNG_32, "image/png"),
+    "/apple-touch-icon.png": (APPLE_TOUCH_ICON_PNG_180, "image/png"),
+}
 
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -2886,6 +2910,15 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif route in ICON_ROUTES and self.command == "GET":
+            body, ctype = ICON_ROUTES[route]
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Cache-Control", "public, max-age=86400")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -3974,7 +4007,7 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
         return time.time()
 
     elif lower_msg in ["!commands", "!help"]:
-        cmd_url = "http://217.154.36.84:8011/commands"
+        cmd_url = "https://youtube-livestream-chatbot.onrender.com/commands"
         sendReplyToLiveChat(liveChatId, f"{userName} -> The bot commands are available at {cmd_url}", stream_name=stream_name)
         return time.time()
 
@@ -4188,7 +4221,7 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
         return time.time()
 
     elif lower_msg == "!leaderboard":
-        theme_master = "http://217.154.36.84:8011/leaderboard"
+        theme_master = "https://youtube-livestream-chatbot.onrender.com/leaderboard"
         sendReplyToLiveChat(liveChatId, f"{userName} -> The leaderboard is available at {theme_master}", stream_name=stream_name)
         return time.time()
 
