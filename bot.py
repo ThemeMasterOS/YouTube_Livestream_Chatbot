@@ -14,10 +14,12 @@ import base64
 import html as html_lib
 import hmac
 import hashlib
-from datetime import datetime, timedelta
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from collections import deque
 from contextlib import contextmanager
+from email.utils import parsedate_to_datetime
 from http.cookies import SimpleCookie
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from dotenv import load_dotenv
@@ -264,6 +266,18 @@ def chat_gone_description(e):
 chat_logs = deque(maxlen=100)   # holds (id, text) tuples
 _log_lock = threading.Lock()
 _log_counter = 0                # monotonically increasing log ID
+_load_log_state = {}            # key -> last load-status message (suppresses identical repeats)
+
+
+def _log_load_once(key, message):
+    """Log a load-status line only when it differs from the last one for this key.
+    Config files are re-read periodically (the channel monitor does it every
+    few seconds), so an unchanged 'Loaded N ...' line should not be repeated."""
+    with _log_lock:
+        if _load_log_state.get(key) == message:
+            return
+        _load_log_state[key] = message
+    add_log(message)
 
 # --- Live Streams Storage ---
 STREAMS_FILE = "streams_config.json"
@@ -333,13 +347,13 @@ def github_load_json(file_path):
         return json.loads(content)
     except urllib.error.HTTPError as e:
         if e.code == 404:
-            add_log(f"No {file_path} in GitHub repo yet — starting fresh.")
+            _log_load_once(f"{file_path}:github", f"No {file_path} in GitHub repo yet — starting fresh.")
             _github_file_shas[file_path] = None
             return {}
-        add_log(f"GitHub load error ({file_path}): {e}")
+        _log_load_once(f"{file_path}:github", f"GitHub load error ({file_path}): {e}")
         return None  # Signals "couldn't reach GitHub", distinct from "empty"
     except Exception as e:
-        add_log(f"GitHub load error ({file_path}): {e}")
+        _log_load_once(f"{file_path}:github", f"GitHub load error ({file_path}): {e}")
         return None
 
 
@@ -377,7 +391,7 @@ def load_json_with_fallback(file_path, label):
     if _github_configured():
         data = github_load_json(file_path)
         if data is not None:
-            add_log(f"Loaded {len(data)} {label} from GitHub")
+            _log_load_once(f"{file_path}:load", f"Loaded {len(data)} {label} from GitHub")
             # Keep a local cache too, in case GitHub is briefly unreachable later
             try:
                 with open(file_path, 'w') as f:
@@ -385,20 +399,20 @@ def load_json_with_fallback(file_path, label):
             except Exception:
                 pass
             return data
-        add_log(f"GitHub unreachable — falling back to local disk cache for {file_path}.")
+        _log_load_once(f"{file_path}:load", f"GitHub unreachable — falling back to local disk cache for {file_path}.")
 
     # Local disk fallback (also the only path if GitHub isn't configured at all)
     if os.path.exists(file_path):
         try:
             with open(file_path, 'r') as f:
                 data = json.load(f)
-                add_log(f"Loaded {len(data)} {label} from local {file_path}")
+                _log_load_once(f"{file_path}:load", f"Loaded {len(data)} {label} from local {file_path}")
                 return data
         except Exception as e:
             add_log(f"Error loading local {file_path}: {e}")
             return {}
     else:
-        add_log(f"{file_path} not found locally. Starting with empty {label}.")
+        _log_load_once(f"{file_path}:load", f"{file_path} not found locally. Starting with empty {label}.")
         return {}
 
 
@@ -417,12 +431,53 @@ def save_json_with_backup(file_path, data, description):
         add_log(f"GITHUB_TOKEN/GITHUB_REPO not set — skipping GitHub backup for {file_path} (local only, won't survive cold-start).")
 
 
+# The channel monitor re-reads the stream list on every tick, and every /live
+# request used to do a fresh GitHub read too. A GitHub round trip (plus a
+# "Loaded N stream(s)" line) every few seconds was both slow and noisy, so the
+# list is cached in memory and written through on every save. Edits made
+# through the dashboard appear on the next read; edits made directly on GitHub
+# are picked up after STREAMS_CACHE_TTL_SECONDS, the same way coins and
+# moderation settings already work.
+STREAMS_CACHE_TTL_SECONDS = 60
+_streams_cache = None
+_streams_cache_time = 0.0
+_streams_version = 0
+_streams_cache_lock = threading.Lock()
+
+
 def load_streams():
-    return load_json_with_fallback(STREAMS_FILE, "stream(s)")
+    """Return a private copy of the saved streams, using a short-lived cache."""
+    global _streams_cache, _streams_cache_time
+
+    with _streams_cache_lock:
+        if _streams_cache is not None and (time.time() - _streams_cache_time) < STREAMS_CACHE_TTL_SECONDS:
+            return copy.deepcopy(_streams_cache)
+        version_before_fetch = _streams_version
+
+    fetched = load_json_with_fallback(STREAMS_FILE, "stream(s)")
+    if not isinstance(fetched, dict):
+        fetched = {}
+
+    with _streams_cache_lock:
+        if _streams_version != version_before_fetch and _streams_cache is not None:
+            # A save landed while GitHub was being read: keep the newer cache.
+            return copy.deepcopy(_streams_cache)
+        _streams_cache = copy.deepcopy(fetched)
+        _streams_cache_time = time.time()
+        return fetched
 
 
 def save_streams(streams):
-    save_json_with_backup(STREAMS_FILE, streams, f"{len(streams)} stream(s)")
+    """Save the stream list locally/GitHub and update the in-memory cache immediately."""
+    global _streams_cache, _streams_cache_time, _streams_version
+
+    snapshot = copy.deepcopy(streams)  # later changes by the caller must not leak in
+    with _streams_cache_lock:
+        _streams_cache = snapshot
+        _streams_cache_time = time.time()
+        _streams_version += 1
+
+    save_json_with_backup(STREAMS_FILE, snapshot, f"{len(snapshot)} stream(s)")
 
 
 # --- Saved Channels (v0.2.7) ---
@@ -461,6 +516,7 @@ def _channels_state_locked():
                 clean[cid] = {
                     "name": str(entry.get("name") or ""),
                     "handle": str(entry.get("handle") or ""),
+                    "monitor": entry.get("monitor") is True,   # v0.3.2.0: optional; missing = OFF
                 }
         _channels_state = {
             "imported_stream_channels": bool(raw.get("imported_stream_channels")),
@@ -479,7 +535,7 @@ def list_saved_channels():
     """Saved channels as a list of {id, name, handle}, sorted by display name."""
     with _channels_lock:
         channels = _channels_state_locked()["channels"]
-        items = [{"id": cid, "name": e["name"], "handle": e["handle"]} for cid, e in channels.items()]
+        items = [{"id": cid, "name": e["name"], "handle": e["handle"], "monitor": bool(e.get("monitor"))} for cid, e in channels.items()]
     items.sort(key=lambda c: channel_display_name(c["id"], c).lower())
     return items
 
@@ -487,7 +543,7 @@ def list_saved_channels():
 def get_saved_channel(channel_id):
     with _channels_lock:
         entry = _channels_state_locked()["channels"].get(channel_id)
-        return {"id": channel_id, "name": entry["name"], "handle": entry["handle"]} if entry else None
+        return {"id": channel_id, "name": entry["name"], "handle": entry["handle"], "monitor": bool(entry.get("monitor"))} if entry else None
 
 
 def upsert_saved_channel(channel_id, name, handle, replace_id=None):
@@ -495,10 +551,29 @@ def upsert_saved_channel(channel_id, name, handle, replace_id=None):
     changed the ID), the old entry is removed so the channel is re-keyed."""
     with _channels_lock:
         channels = _channels_state_locked()["channels"]
+        monitor = bool((channels.get(channel_id) or {}).get("monitor"))   # editing must never reset the Monitor switch
         if replace_id and replace_id != channel_id:
+            monitor = bool((channels.get(replace_id) or {}).get("monitor"))
             channels.pop(replace_id, None)
-        channels[channel_id] = {"name": name, "handle": handle}
+        channels[channel_id] = {"name": name, "handle": handle, "monitor": monitor}
         _persist_channels_locked()
+
+
+def set_channel_monitor(channel_id, enabled):
+    """Turn automatic livestream monitoring on/off for one saved channel. Returns False if it isn't saved."""
+    with _channels_lock:
+        channels = _channels_state_locked()["channels"]
+        if channel_id not in channels:
+            return False
+        if bool(channels[channel_id].get("monitor")) != bool(enabled):
+            channels[channel_id]["monitor"] = bool(enabled)
+            _persist_channels_locked()
+        return True
+
+
+def monitored_channel_ids():
+    with _channels_lock:
+        return [cid for cid, e in _channels_state_locked()["channels"].items() if e.get("monitor")]
 
 
 def delete_saved_channel(channel_id):
@@ -520,7 +595,7 @@ def ensure_channel_saved(channel_id):
         channels = _channels_state_locked()["channels"]
         if channel_id in channels:
             return False
-        channels[channel_id] = {"name": "", "handle": ""}
+        channels[channel_id] = {"name": "", "handle": "", "monitor": False}
         _persist_channels_locked()
         return True
 
@@ -540,7 +615,7 @@ def import_stream_channels_once(streams):
         for data in (streams or {}).values():
             cid = data.get("channel_id") if isinstance(data, dict) else None
             if cid and pytchat_manual_channel_patch.is_valid_channel_id(cid) and cid not in state["channels"]:
-                state["channels"][cid] = {"name": "", "handle": ""}
+                state["channels"][cid] = {"name": "", "handle": "", "monitor": False}
                 added += 1
         if added:
             state["imported_stream_channels"] = True
@@ -1085,7 +1160,7 @@ def get_leaderboard_rows():
 
 
 # ---------------------------------------------------------------------------
-# Sudo mode: /live and /moderation are read-only unless the browser carries a
+# Sudo mode: /channels, /live and /moderation are read-only unless the browser carries a
 # valid signed cookie. The password lives in the ADMIN_PASSWORD env var (never
 # in the code or repo). SESSION_SECRET is optional; if unset, the signing key
 # is derived from the password, so changing the password logs everyone out.
@@ -1101,7 +1176,7 @@ _login_lock = threading.Lock()
 SUDO_AUTH_ROUTES = ("/api/auth/login", "/api/auth/logout")
 
 if not ADMIN_PASSWORD:
-    print("⚠️ ADMIN_PASSWORD is not set: sudo mode is disabled and /live + /moderation stay read-only.", flush=True)
+    print("⚠️ ADMIN_PASSWORD is not set: sudo mode is disabled and /channels + /live + /moderation stay read-only.", flush=True)
 
 
 def _sudo_sign(expiry):
@@ -1570,11 +1645,11 @@ CHANNEL_UI_JS = r"""
 # ---------------------------------------------------------------------------
 # v0.3.0.0 dashboard: one shell page with hash routing (/#/home, /#/logs, ...).
 # The shell is a plain (non-f) string; __BOOT__ becomes JSON (admin flag, commands, counts).
-# Live and Moderation are served as fragments (/_view/live, /_view/moderation) and run inside the shell.
+# Channels, Live and Moderation are served as fragments (/_view/channels, /_view/live, /_view/moderation) and run inside the shell.
 # ---------------------------------------------------------------------------
-BOT_VERSION = "0.3.1.1"
+BOT_VERSION = "0.3.2.0"
 BOT_STARTED_AT = time.time()
-DASHBOARD_PAGES = ("home", "commands", "leaderboard", "logs", "live", "moderation", "themes")
+DASHBOARD_PAGES = ("home", "commands", "leaderboard", "logs", "channels", "live", "moderation", "themes")
 
 
 def _cached_user_count():
@@ -1857,7 +1932,7 @@ __CHANNEL_CSS__
   try { boot = JSON.parse($('boot').textContent); } catch (e) {}
   var admin = !!boot.admin;           // cosmetic only: the server enforces sudo on every write
   var cleanups = [], navTok = 0;
-  var FRAG = { live: 1, moderation: 1 };
+  var FRAG = { channels: 1, live: 1, moderation: 1 };
 
   function esc(s) { return String(s).replace(/[&<>"']/g, function (c) { return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
   function pad(n) { return (n < 10 ? '0' : '') + n; }
@@ -1896,7 +1971,7 @@ __CHANNEL_CSS__
   /* ---------- router ---------- */
   var ROUTES = {
     home: ['🏠', 'Home', renderHome], commands: ['📜', 'Commands', renderCommands], leaderboard: ['🏆', 'Leaderboard', renderBoard],
-    logs: ['🧾', 'Logs', renderLogs], live: ['📡', 'Live', function () { loadFragment('live'); }],
+    logs: ['🧾', 'Logs', renderLogs], channels: ['📺', 'Channels', function () { loadFragment('channels'); }], live: ['📡', 'Live', function () { loadFragment('live'); }],
     moderation: ['🛡️', 'Moderation', function () { loadFragment('moderation'); }], themes: ['🎨', 'Themes', renderThemes]
   };
   $('nav').innerHTML = Object.keys(ROUTES).map(function (k) {
@@ -2122,7 +2197,7 @@ __CHANNEL_CSS__
       $('retry').addEventListener('click', render);
     });
   }
-  /* Called by the Live / Moderation fragments after an add, edit or remove. Only refreshes if that tab is still open. */
+  /* Called by the Channels / Live / Moderation fragments after an add, edit or remove. Only refreshes if that tab is still open. */
   window.__refreshView = function (name) {
     if (boot.notFound || !FRAG[name] || current() !== name) return;
     loadFragment(name, true);
@@ -2190,6 +2265,154 @@ ICON_ROUTES = {
     "/favicon-32.png": (FAVICON_PNG_32, "image/png"),
     "/apple-touch-icon.png": (APPLE_TOUCH_ICON_PNG_180, "image/png"),
 }
+
+
+CHANNELS_FRAGMENT_HTML = r"""
+<div class="frag frag-channels" id="chanRoot"><h1>📺 Channels</h1><p class="sub">Saved channels and automatic livestream monitoring.</p><div class="lockbar" id="lockbar"></div>
+<style>
+.frag-channels .chcard{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:12px}
+.frag-channels .chhead{display:flex;gap:10px;justify-content:space-between;align-items:flex-start;flex-wrap:wrap}
+.frag-channels .chname{font-weight:700;overflow-wrap:anywhere}
+.frag-channels .mswitch{display:inline-flex;align-items:center;gap:8px;min-height:44px;cursor:pointer;font-weight:600}
+.frag-channels .mswitch input{width:22px;height:22px}
+.frag-channels .note{color:var(--muted);font-size:13px;margin:6px 0}
+.frag-channels .bc{border-top:1px dashed var(--line);padding:8px 0;font-size:14px;overflow-wrap:anywhere}
+.frag-channels .bc .start-lst{margin:6px 0 0 6px;min-height:34px;padding:4px 10px}
+.frag-channels .editbox input{width:100%;margin:4px 0 8px}
+.frag-channels .err{color:var(--warn)}
+.frag-channels .st{min-height:20px;font-size:13px;margin:6px 0}
+</style>
+<div class="chcard"><h3>➕ Add Channel</h3>
+<input type="text" id="chAddName" placeholder="Display name (optional)" autocomplete="off">
+<input type="text" id="chAddInput" placeholder="@handle, channel link, or UC… ID" autocomplete="off" style="margin-top:8px">
+<div class="row" style="margin-top:8px"><button type="button" id="chAddBtn" class="add-btn">Add Channel</button></div>
+<div class="st" id="chanStatus" role="status"></div>
+<p class="note">New channels start with monitoring OFF. Turn Monitor on only for channels you want the bot to watch.</p></div>
+<div class="note" id="chanSummary">Loading…</div>
+<div id="chanList"></div>
+</div>
+<script>
+(function () {
+  var ADMIN = __ADMIN__;
+  var root = document.getElementById('chanRoot'); if (!root) return;
+  var list = document.getElementById('chanList'), sum = document.getElementById('chanSummary'), st = document.getElementById('chanStatus');
+  var editing = null, last = null, busy = false;
+  var PHASE = { listening: '🟢 Listening', waiting_chat: '⏳ Waiting for chat to open', queued: '🕒 Waiting for a pre-start slot',
+                starting: '▶ Connecting…', checking: '🔎 Checking…', manual: '✋ Managed on the Live tab', dismissed: '🚫 Removed on the Live tab' };
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
+  function pad(n) { return (n < 10 ? '0' : '') + n; }
+  function fmt(ts) {
+    if (!ts) return '–';
+    var d = new Date(ts * 1000), n = new Date(), t = pad(d.getHours()) + ':' + pad(d.getMinutes());
+    return d.toDateString() === n.toDateString() ? t : pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' + t;
+  }
+  function setSt(msg, isErr) { st.textContent = msg || ''; st.classList.toggle('err', !!isErr); }
+  function api(url, method, body) {
+    var opt = { method: method, cache: 'no-store' };
+    if (body) { opt.headers = { 'Content-Type': 'application/json' }; opt.body = JSON.stringify(body); }
+    return fetch(url, opt).then(function (r) { return r.json().catch(function () { return {}; }).then(function (d) { return { ok: r.ok, d: d }; }); });
+  }
+  function dis() { return ADMIN ? '' : ' disabled'; }
+
+  function card(c) {
+    var ident = c.handle ? esc(c.handle) : '<code>' + esc(c.id) + '</code>';
+    var h = '<div class="chcard" data-id="' + esc(c.id) + '"><div class="chhead"><div><div class="chname">' + esc(c.name || c.handle || c.id) + '</div><div class="note" style="margin:2px 0">' + ident + '</div></div>' +
+      '<label class="mswitch"><input type="checkbox" class="mon" data-id="' + esc(c.id) + '"' + (c.monitor ? ' checked' : '') + dis() + '> Monitor ' + (c.monitor ? 'ON' : 'OFF') + '</label></div>';
+    if (c.monitor) {
+      h += '<div class="note">RSS checked ' + fmt(c.last_rss) + ' · Search checked ' + fmt(c.last_search) + ' (next ' + fmt(c.next_search) + ')' +
+           (c.search_note ? ' · ' + esc(c.search_note) : '') + (c.rss_err ? ' · <span class="err">RSS error: ' + esc(c.rss_err) + '</span>' : '') + '</div>';
+    } else {
+      h += '<div class="note">Monitoring is off for this channel.</div>';
+    }
+    if (c.last_found) h += '<div class="note">Last livestream found: ' + esc(c.last_found.title) + ' (' + fmt(c.last_found.at) + ')</div>';
+    (c.broadcasts || []).forEach(function (b) {
+      h += '<div class="bc">' + (b.status === 'live' ? '🔴 Live' : '📅 Upcoming ' + fmt(b.scheduled)) + ' · ' + esc(b.title) + '<br><code>' + esc(b.id) + '</code> · ' + (PHASE[b.phase] || esc(b.phase));
+      if (b.phase === 'dismissed') {
+        h += ' <button type="button" class="start-lst add-btn" data-id="' + esc(b.id) + '"' + dis() + '>▶ Start listener</button>';
+      }
+      h += '</div>';
+    });
+    if (editing === c.id) {
+      h += '<div class="editbox"><input type="text" class="eName" placeholder="Display name" value="' + esc(c.name) + '"' + dis() + '>' +
+           '<input type="text" class="eInput" placeholder="@handle or UC… ID" value="' + esc(c.handle || c.id) + '"' + dis() + '>' +
+           '<div class="row"><button type="button" class="eSave add-btn"' + dis() + '>Save</button><button type="button" class="eCancel">Cancel</button><button type="button" class="eDel"' + dis() + '>Delete</button></div></div>';
+    } else {
+      h += '<div class="row"><button type="button" class="eOpen" data-id="' + esc(c.id) + '"' + dis() + '>✏️ Edit</button></div>';
+    }
+    return h + '</div>';
+  }
+
+  function render(d) {
+    last = d;
+    var parts = Object.keys(d.search_today || {}).map(function (k) { return esc(k) + ' ' + d.search_today[k] + '/' + d.search_limit; });
+    sum.innerHTML = 'Pre-start listeners: <b>' + d.prestart_running + ' / ' + d.cap + '</b> (auto-added upcoming broadcasts only) · Search calls today: ' + (parts.join(' · ') || '–') +
+      (d.search_exhausted && d.search_exhausted.length ? ' · <span class="err">search used up: ' + esc(d.search_exhausted.join(', ')) + '</span>' : '');
+    list.innerHTML = d.channels.length ? d.channels.map(card).join('') : '<p class="note">No saved channels yet. Add one above.</p>';
+  }
+  function load() {
+    return api('/api/monitor/status', 'GET').then(function (r) { if (r.ok) render(r.d); else sum.textContent = 'Could not load channel status.'; })
+      .catch(function () { sum.textContent = 'Could not load channel status.'; });
+  }
+
+  list.addEventListener('change', function (e) {
+    var el = e.target; if (!el.classList.contains('mon')) return;
+    var on = el.checked; el.disabled = true;
+    api('/api/monitor/toggle', 'POST', { id: el.dataset.id, monitor: on }).then(function (r) {
+      setSt(r.d.message || (r.ok ? 'Saved.' : 'Could not save.'), !r.ok);
+      if (r.ok && r.d.status) render(r.d.status); else load();
+    }).catch(function () { setSt('Network error.', true); load(); });
+  });
+  list.addEventListener('click', function (e) {
+    var b = e.target.closest('button'); if (!b) return;
+    var cardEl = b.closest('.chcard'), id = cardEl ? cardEl.dataset.id : '';
+    if (b.classList.contains('start-lst')) {
+      b.disabled = true; setSt('Starting…');
+      api('/api/monitor/start', 'POST', { video_id: b.dataset.id }).then(function (r) {
+        setSt(r.d.message || (r.ok ? 'Starting…' : 'Could not start.'), !r.ok);
+        if (r.d && r.d.status) render(r.d.status); else load();
+        if (r.ok) setTimeout(function () { if (root.isConnected) load(); }, 3000);
+      }).catch(function () { setSt('Network error.', true); b.disabled = false; });
+      return;
+    }
+    if (b.classList.contains('eOpen')) { editing = id; render(last); return; }
+    if (b.classList.contains('eCancel')) { editing = null; render(last); return; }
+    if (b.classList.contains('eSave')) {
+      var name = cardEl.querySelector('.eName').value.trim(), input = cardEl.querySelector('.eInput').value.trim();
+      if (!input) { setSt('Enter a handle or a channel ID.', true); return; }
+      b.disabled = true; setSt('Saving…');
+      api('/api/channels', 'POST', { id: id, name: name, input: input }).then(function (r) {
+        setSt(r.d.message || 'Done.', !r.ok); if (r.ok) editing = null; load();
+      }).catch(function () { setSt('Network error.', true); b.disabled = false; });
+      return;
+    }
+    if (b.classList.contains('eDel')) {
+      if (!confirm('Delete this channel from the saved list?\nStreams already using it keep their channel ID.')) return;
+      b.disabled = true;
+      api('/api/channels/' + encodeURIComponent(id), 'DELETE').then(function (r) {
+        setSt(r.d.message || 'Done.', !r.ok); editing = null; load();
+      }).catch(function () { setSt('Network error.', true); b.disabled = false; });
+    }
+  });
+  document.getElementById('chAddBtn').addEventListener('click', function () {
+    var btn = this, name = document.getElementById('chAddName').value.trim(), input = document.getElementById('chAddInput').value.trim();
+    if (!input) { setSt('Enter a handle or a channel ID.', true); return; }
+    btn.disabled = true; setSt('Looking up the channel…');
+    api('/api/channels', 'POST', { id: '', name: name, input: input }).then(function (r) {
+      btn.disabled = false; setSt(r.d.message || 'Done.', !r.ok);
+      if (r.ok) { document.getElementById('chAddName').value = ''; document.getElementById('chAddInput').value = ''; load(); }
+    }).catch(function () { btn.disabled = false; setSt('Network error.', true); });
+  });
+
+  load();
+  var timer = setInterval(function () {
+    if (!root.isConnected) { clearInterval(timer); return; }
+    var a = document.activeElement;
+    if (document.hidden || editing !== null || (a && root.contains(a) && /^(INPUT|TEXTAREA)$/.test(a.tagName))) return;
+    load();
+  }, 15000);
+})();
+</script>
+"""
 
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -2885,6 +3108,90 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
 </div>
 """
 
+    def _handle_monitor_toggle(self):
+        """POST /api/monitor/toggle {id, monitor}. Sudo-guarded twice: default-deny in do_GET plus this explicit check."""
+        if not self._is_admin():
+            self._send_json(401, {"message": "🔒 Sudo mode required. Tap 'Sudo mode' at the top right and enter the password."})
+            return
+        try:
+            length = min(int(self.headers.get('Content-Length', 0)), 4096)
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(body, dict):
+                raise ValueError("body must be an object")
+        except Exception:
+            self._send_json(400, {"message": "Bad request."})
+            return
+        channel_id = str(body.get("id") or "").strip()
+        saved = get_saved_channel(channel_id) if pytchat_manual_channel_patch.is_valid_channel_id(channel_id) else None
+        if saved is None:
+            self._send_json(404, {"message": "That channel isn't in the saved list."})
+            return
+        enabled = body.get("monitor") is True
+        set_channel_monitor(channel_id, enabled)
+        label = channel_display_name(channel_id, saved)
+        add_log(f"📡 Monitor {'ON' if enabled else 'OFF'} for channel '{label}' ({channel_id}).")
+        self._send_json(200, {
+            "message": f"Monitoring {'enabled' if enabled else 'disabled'} for '{label}'.",
+            "status": monitor_status_snapshot(),
+        })
+
+    def _handle_monitor_start(self):
+        """POST /api/monitor/start {video_id}. Re-arms a broadcast the user removed from the Live tab."""
+        if not self._is_admin():
+            self._send_json(401, {"message": "🔒 Sudo mode required. Tap 'Sudo mode' at the top right and enter the password."})
+            return
+        try:
+            length = min(int(self.headers.get('Content-Length', 0)), 4096)
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(body, dict):
+                raise ValueError("body must be an object")
+        except Exception:
+            self._send_json(400, {"message": "Bad request."})
+            return
+
+        video_id = str(body.get("video_id") or "").strip()
+        if not _VIDEO_ID_RE.match(video_id):
+            self._send_json(400, {"message": "That is not a valid video ID."})
+            return
+
+        if is_stream_running(video_id):
+            with _mon_lock:
+                rec = _mon_videos.get(video_id)
+                if rec is not None:
+                    rec.pop("dismissed", None)
+            self._send_json(200, {
+                "message": "That broadcast is already listening.",
+                "status": monitor_status_snapshot(),
+            })
+            return
+
+        with _mon_lock:
+            rec = _mon_videos.get(video_id)
+            missing = rec is None or rec.get("state") != "tracked"
+            if not missing:
+                title = rec.get("title") or video_id
+                rec.pop("dismissed", None)
+                rec.pop("manual", None)    # an explicit Start makes it the monitor's broadcast again
+                rec["auto_added"] = False  # otherwise _mon_admit() re-dismisses it immediately (no Live-tab entry)
+                rec["queued"] = False
+                rec["starts"] = []         # an explicit restart shouldn't be blocked by the hourly restart guard
+                rec["next_check"] = 0      # verify/start on the next monitor tick
+
+        if missing:
+            self._send_json(404, {"message": "The monitor no longer knows this broadcast. Add the video ID on the Live tab instead."})
+            return
+
+        _mon_clear_once(f"restart-limit-{video_id}")
+        add_log(f"📡 Monitor: manual restart requested for '{title}' ({video_id}).")
+        self._send_json(200, {
+            "message": f"Starting '{title}' again — it should appear on the Live tab within a few seconds.",
+            "status": monitor_status_snapshot(),
+        })
+
+    def _channels_fragment(self):
+        """The Channels tab. Read-only without sudo (controls disabled in the shell; the server enforces every write)."""
+        return CHANNELS_FRAGMENT_HTML.replace("__ADMIN__", "true" if self._is_admin() else "false")
+
     def do_GET(self):
         route = self.path.split("?")[0]
 
@@ -2928,6 +3235,18 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
 
         elif route == "/_view/moderation" and self.command == "GET":
             self._send_html(200, self._moderation_fragment())
+
+        elif route == "/_view/channels" and self.command == "GET":
+            self._send_html(200, self._channels_fragment())
+
+        elif route == "/api/monitor/status" and self.command == "GET":
+            self._send_json(200, monitor_status_snapshot())
+
+        elif route == "/api/monitor/toggle" and self.command == "POST":
+            self._handle_monitor_toggle()
+
+        elif route == "/api/monitor/start" and self.command == "POST":
+            self._handle_monitor_start()
 
         elif self.path.split("?")[0] == "/api/leaderboard":
             body = json.dumps({"rows": get_leaderboard_rows()}).encode("utf-8")
@@ -2987,6 +3306,8 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
 
                 label = data.get('label', '').strip() if has_label_field else existing.get('label', '')
                 record = dict(existing)  # keep any other saved fields
+                record.pop('auto', None)    # v0.3.2.0: a stream saved/edited by hand here is a manual entry; the monitor never touches it
+                record.pop('source', None)
                 record['label'] = label
                 if has_channel_field:
                     if channel_id:
@@ -3254,20 +3575,27 @@ def is_quota_exceeded_error(e):
     )
 
 
-def call_with_quota_failover(make_request, purpose="API call"):
+def call_with_quota_failover(make_request, purpose="API call", bucket="general"):
     """
     Runs make_request(youtube_client) against Main, then Backup 1, then
     Backup 2, moving on only when a client reports quotaExceeded. Any other
     error is re-raised immediately. If every client is exhausted, raises
     AllQuotasExhausted (carrying the seconds until 00:00 PT).
+
+    v0.3.2.0: bucket="search" is for search.list, which Google counts in its own
+    per-project daily bucket (100 calls). Its exhaustion is tracked separately
+    ("<name>:search"), so a used-up search bucket never marks the project's
+    normal 10,000-unit bucket (videos.list, live chat, replies) as exhausted.
+    Every other caller keeps the default bucket="general" and the old behaviour.
     """
     for name, client in _api_clients:
+        key = name if bucket == "general" else f"{name}:{bucket}"
         with _quota_lock:
-            reset_at = _quota_exhausted_until.get(name)
+            reset_at = _quota_exhausted_until.get(key)
             if reset_at is not None and datetime.now(_PT_ZONE) >= reset_at:
-                del _quota_exhausted_until[name]
+                del _quota_exhausted_until[key]
                 reset_at = None
-                add_log(f"Quota reset reached — {name} API is available again.")
+                add_log(f"Quota reset reached — {name} API ({bucket} bucket) is available again.")
             if reset_at is not None:
                 continue  # Still exhausted, skip to the next client
 
@@ -3277,10 +3605,10 @@ def call_with_quota_failover(make_request, purpose="API call"):
             if not is_quota_exceeded_error(e):
                 raise
             with _quota_lock:
-                newly_marked = name not in _quota_exhausted_until
-                _quota_exhausted_until[name] = _next_midnight_pt()
+                newly_marked = key not in _quota_exhausted_until
+                _quota_exhausted_until[key] = _next_midnight_pt()
             if newly_marked:
-                add_log(f"{name} quota exceeded during {purpose}. Switching to next available API client...")
+                add_log(f"{name} {bucket} quota exceeded during {purpose}. Switching to next available API client...")
 
     wait_seconds, utc_offset_label = seconds_until_next_midnight_pt()
     raise AllQuotasExhausted(wait_seconds, utc_offset_label)
@@ -4592,6 +4920,564 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
         add_log(f"'{stream_name}' ({stream_id}) listener stopped (stream ended). /live now shows it as ⚪ Stopped.")
 
 
+# ===========================================================================
+# v0.3.2.0  Channel monitor: automatic livestream discovery
+#
+# For every saved channel whose Monitor switch is ON (default OFF):
+#   * RSS feed, every 2 minutes (no quota): finds new video IDs = candidates.
+#   * search.list eventType="upcoming", every 6 hours: finds scheduled
+#     livestreams that RSS can miss. search.list has its OWN daily bucket per
+#     Google Cloud project (100 calls, 1 per call), tracked separately by
+#     call_with_quota_failover(bucket="search").
+#   * videos.list (snippet + liveStreamingDetails, batched 50 IDs per call,
+#     1 unit): verifies candidates and re-checks known broadcasts every 5
+#     minutes (upcoming -> live -> ended).
+# Verified upcoming/live broadcasts go through the SAME Live-tab machinery as a
+# manual entry (streams_config.json + start_stream_listener), tagged "auto".
+# Upcoming broadcasts connect to chat as soon as YouTube reports a chat ID
+# (pytchat works before the stream starts). Only auto-added UPCOMING listeners
+# count toward MAX_PRESTART_LISTENERS; live broadcasts are never capped and are
+# served first; manual Live-tab entries are never counted or touched.
+# Discovery state is kept in memory only (no GitHub commits every few minutes).
+# ===========================================================================
+MAX_PRESTART_LISTENERS = _env_number("MAX_PRESTART_LISTENERS", 25, int, 0)
+MONITOR_RSS_INTERVAL = 120                  # seconds
+# Consecutive RSS failures: 1m, 2m, 5m, 10m, then 15m forever. HTTP 429 with a
+# Retry-After header waits at least that long; every delay gets a small random
+# jitter so channels that failed together don't retry together.
+MONITOR_RSS_RETRY_DELAYS = [60, 120, 300, 600, 900]
+MONITOR_RSS_RETRY_JITTER = 0.10             # up to 10% extra
+MONITOR_RSS_RETRY_JITTER_MAX = 30           # seconds
+MONITOR_SEARCH_INTERVAL = 6 * 60 * 60       # seconds
+MONITOR_RECHECK_INTERVAL = 300              # seconds, tracked broadcasts
+MONITOR_TICK_SECONDS = 2
+MONITOR_RSS_PER_TICK = 10
+MONITOR_SEARCH_SPACING = 10                 # seconds between any two search.list calls
+MONITOR_VERIFY_BATCH = 50
+MONITOR_VERIFY_BATCHES_PER_TICK = 4
+MONITOR_CANDIDATE_RETRY_DELAYS = [120, 300, 900, 1800, 3600]
+MONITOR_CANDIDATE_MAX_ATTEMPTS = 6
+MONITOR_CANDIDATE_COOLDOWN = 24 * 60 * 60
+MONITOR_CANDIDATE_MAX_CYCLES = 3
+MONITOR_ORDINARY_CONFIRM_DELAY = 600        # an upload/Short must look ordinary on two checks, this far apart
+MONITOR_CHAT_WAIT_DELAYS = [300, 900, 1800, 3600]
+MONITOR_STARTS_PER_TICK = 3
+MONITOR_RESTART_LIMIT = 3                   # listener (re)starts per broadcast per hour
+MONITOR_MAX_REMEMBERED = 5000
+MONITOR_RSS_MAX_BYTES = 512 * 1024
+SEARCH_DEFAULT_DAILY_CALLS = 100            # Google's default search.list allowance per project
+
+_mon_lock = threading.RLock()
+_mon_videos = {}          # video_id -> record (state: candidate | tracked | ordinary | ended)
+_mon_channels = {}        # channel_id -> schedule + status info
+_mon_search_counts = {}   # (PT date, client name) -> search.list calls made
+_mon_search_block_until = 0.0
+_mon_next_search_at = 0.0
+_mon_logged_once = set()
+_mon_thread_started = False
+_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+
+def _mon_log_once(key, message):
+    with _mon_lock:
+        if key in _mon_logged_once:
+            return
+        _mon_logged_once.add(key)
+    add_log(message)
+
+
+def _mon_clear_once(key):
+    with _mon_lock:
+        _mon_logged_once.discard(key)
+
+
+def _mon_parse_time(text):
+    try:
+        return datetime.fromisoformat(str(text).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def _mon_retry_after_seconds(headers):
+    """Retry-After value as seconds (integer or HTTP-date), or None if absent/invalid."""
+    value = headers.get("Retry-After") if headers is not None else None
+    if not value:
+        return None
+    value = str(value).strip()
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(value)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+    except Exception:
+        return None
+
+
+def _mon_rss_retry_delay(fails, exc):
+    """Delay before the next RSS attempt, using the failure schedule and any Retry-After."""
+    index = min(max(int(fails), 1), len(MONITOR_RSS_RETRY_DELAYS)) - 1
+    delay = float(MONITOR_RSS_RETRY_DELAYS[index])
+    if isinstance(exc, urllib.error.HTTPError) and exc.code == 429:
+        retry_after = _mon_retry_after_seconds(exc.headers)
+        if retry_after is not None:
+            delay = max(delay, retry_after)   # never retry before the server's own minimum
+    jitter = random.uniform(0, min(MONITOR_RSS_RETRY_JITTER_MAX, delay * MONITOR_RSS_RETRY_JITTER))
+    return delay + jitter
+
+
+def _mon_short_delay(seconds):
+    seconds = int(round(seconds))
+    return f"{seconds}s" if seconds < 60 else f"{seconds // 60}m {seconds % 60}s"
+
+
+def _mon_fetch_rss(channel_id):
+    url = "https://www.youtube.com/feeds/videos.xml?channel_id=" + channel_id
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; ThemeMasterBot/0.3.2)"})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = resp.read(MONITOR_RSS_MAX_BYTES + 1)
+    if len(data) > MONITOR_RSS_MAX_BYTES:
+        raise ValueError("feed too large")
+    lowered = data.lower()
+    if b"<!doctype" in lowered or b"<!entity" in lowered:
+        raise ValueError("unexpected DTD in feed")
+    root = ET.fromstring(data)
+    ids = []
+    for el in root.iter("{http://www.youtube.com/xml/schemas/2015}videoId"):
+        vid = (el.text or "").strip()
+        if _VIDEO_ID_RE.match(vid) and vid not in ids:
+            ids.append(vid)
+    return ids
+
+
+def _mon_note_search_call(client):
+    day = datetime.now(_PT_ZONE).strftime("%Y-%m-%d")
+    with _mon_lock:
+        key = (day, _client_name(client))
+        _mon_search_counts[key] = _mon_search_counts.get(key, 0) + 1
+        for k in [k for k in _mon_search_counts if k[0] != day]:
+            del _mon_search_counts[k]
+
+
+def _mon_search_upcoming(channel_id):
+    """One search.list call (first page only) for this channel's scheduled livestreams."""
+    def request(yt):
+        _mon_note_search_call(yt)
+        return yt.search().list(
+            part="id", channelId=channel_id, eventType="upcoming", type="video", maxResults=50
+        ).execute()
+    resp = call_with_quota_failover(request, "upcoming livestream search", bucket="search")
+    ids = []
+    for item in resp.get("items", []):
+        ident = item.get("id")
+        vid = ident.get("videoId") if isinstance(ident, dict) else None
+        if vid and _VIDEO_ID_RE.match(vid) and vid not in ids:
+            ids.append(vid)
+    return ids
+
+
+def _mon_prune_locked():
+    if len(_mon_videos) <= MONITOR_MAX_REMEMBERED:
+        return
+    old = sorted(
+        (v for v, r in _mon_videos.items() if r.get("state") in ("ordinary", "ended")),
+        key=lambda v: _mon_videos[v].get("ended_at") or _mon_videos[v].get("first_seen") or 0,
+    )
+    for v in old[: len(_mon_videos) - MONITOR_MAX_REMEMBERED]:
+        del _mon_videos[v]
+
+
+def _mon_add_candidate(video_id, channel_id, source):
+    now = time.time()
+    with _mon_lock:
+        if video_id in _mon_videos:
+            return False
+        _mon_videos[video_id] = {
+            "state": "candidate", "channel_id": channel_id, "source": source,
+            "attempts": 0, "cycles": 0, "strikes": 0, "errors": 0,
+            "first_seen": now, "next_check": now,
+        }
+        _mon_prune_locked()
+        return True
+
+
+def _mon_sync_channels():
+    ids = set(monitored_channel_ids())
+    now = time.time()
+    with _mon_lock:
+        new_ids = [cid for cid in sorted(ids) if cid not in _mon_channels]
+        total = max(len(ids), 1)
+        rss_gap = min(1.0, MONITOR_RSS_INTERVAL / total)
+        search_gap = min(30.0, MONITOR_SEARCH_INTERVAL / total)
+        for i, cid in enumerate(new_ids):
+            _mon_channels[cid] = {
+                "active": True, "rss_next": now + i * rss_gap, "search_next": now + 20 + i * search_gap,
+                "rss_fails": 0, "search_fails": 0, "last_rss": None, "last_search": None,
+                "rss_err": "", "search_note": "", "last_found": None,
+            }
+        for cid, ch in _mon_channels.items():
+            was = ch.get("active")
+            ch["active"] = cid in ids
+            if ch["active"] and not was and cid not in new_ids:
+                # Switched back on: never search again sooner than 6 hours after its last search.
+                ch["rss_next"] = now
+                ch["search_next"] = max(now + 20, (ch.get("last_search") or 0) + MONITOR_SEARCH_INTERVAL)
+
+
+def _mon_run_rss():
+    now = time.time()
+    with _mon_lock:
+        due = [cid for cid, ch in _mon_channels.items() if ch["active"] and ch["rss_next"] <= now]
+    due.sort(key=lambda c: _mon_channels[c]["rss_next"])
+    for cid in due[:MONITOR_RSS_PER_TICK]:
+        ch = _mon_channels[cid]
+        try:
+            ids = _mon_fetch_rss(cid)
+            for vid in ids:
+                _mon_add_candidate(vid, cid, "rss")
+            if ch["rss_fails"]:
+                add_log(f"Monitor: RSS for channel {_short_channel_id(cid)} is working again after {ch['rss_fails']} failure(s).")
+            ch.update(last_rss=time.time(), rss_fails=0, rss_err="", rss_next=time.time() + MONITOR_RSS_INTERVAL)
+        except Exception as e:
+            fails = ch["rss_fails"] + 1
+            ch["rss_fails"] = fails
+            ch["rss_err"] = str(e)[:120]
+            delay = _mon_rss_retry_delay(fails, e)
+            ch["rss_next"] = time.time() + delay
+            if fails == 1 or fails % 5 == 0:
+                add_log(f"Monitor: RSS check failed for channel {_short_channel_id(cid)} ({e}). "
+                        f"Retrying in {_mon_short_delay(delay)} (failure {fails}).")
+
+
+def _mon_run_search():
+    global _mon_search_block_until, _mon_next_search_at
+    now = time.time()
+    if now < _mon_search_block_until or now < _mon_next_search_at:
+        return
+    with _mon_lock:
+        due = [cid for cid, ch in _mon_channels.items() if ch["active"] and ch["search_next"] <= now]
+    if not due:
+        return
+    due.sort(key=lambda c: _mon_channels[c]["search_next"])
+    cid = due[0]
+    ch = _mon_channels[cid]
+    _mon_next_search_at = time.time() + MONITOR_SEARCH_SPACING
+    try:
+        ids = _mon_search_upcoming(cid)
+        for vid in ids:
+            _mon_add_candidate(vid, cid, "search")
+        ch.update(last_search=time.time(), search_fails=0, search_next=time.time() + MONITOR_SEARCH_INTERVAL,
+                  search_note=f"{len(ids)} upcoming found")
+        _mon_clear_once("search-exhausted")
+    except AllQuotasExhausted as qe:
+        _mon_search_block_until = time.time() + qe.wait_seconds + 5
+        ch["search_note"] = "search quota used up until reset"
+        _mon_log_once("search-exhausted",
+                      f"Monitor: every project's search.list allowance is used up. Scheduled-livestream searches resume after 00:00 PT ({qe.utc_offset_label} UTC); RSS keeps running.")
+    except Exception as e:
+        ch["search_fails"] += 1
+        ch["search_note"] = f"error: {str(e)[:100]}"
+        ch["search_next"] = time.time() + min(1800 * (2 ** (ch["search_fails"] - 1)), MONITOR_SEARCH_INTERVAL)
+        add_log(f"Monitor: search.list failed for channel {_short_channel_id(cid)} ({e}). Will retry later.")
+
+
+# --- verification ---------------------------------------------------------
+def _mon_uncertain(vid, rec, now):
+    """Details missing/unclear: retry with growing delays; never discard permanently."""
+    rec["attempts"] = rec.get("attempts", 0) + 1
+    if rec["attempts"] >= MONITOR_CANDIDATE_MAX_ATTEMPTS:
+        rec["cycles"] = rec.get("cycles", 0) + 1
+        rec["attempts"] = 0
+        if rec["cycles"] >= MONITOR_CANDIDATE_MAX_CYCLES:
+            with _mon_lock:
+                _mon_videos.pop(vid, None)    # forgotten, so a later RSS/search hit can start fresh
+            return
+        rec["next_check"] = now + MONITOR_CANDIDATE_COOLDOWN
+        return
+    rec["next_check"] = now + MONITOR_CANDIDATE_RETRY_DELAYS[min(rec["attempts"] - 1, len(MONITOR_CANDIDATE_RETRY_DELAYS) - 1)]
+
+
+def _mon_stop_auto_stream(vid, reason):
+    """Remove an auto-added stream (stops its listener). Manual Live-tab entries are never touched."""
+    streams = load_streams()
+    entry = streams.get(vid)
+    if isinstance(entry, dict) and entry.get("auto"):
+        label = entry.get("label") or vid
+        _remove_stream_record(streams, vid)
+        save_streams(streams)
+        add_log(f"📡 Monitor: '{label}' ({vid}) {reason}. Listener stopped and removed from the Live list.")
+
+
+def _mon_mark_ended(vid, rec, reason="ended"):
+    with _mon_lock:
+        was_tracked = rec.get("state") == "tracked"
+        rec["state"] = "ended"
+        rec["ended_at"] = time.time()
+        rec.pop("next_check", None)
+    if was_tracked or rec.get("auto_added"):
+        _mon_stop_auto_stream(vid, reason)
+
+
+def _mon_next_tracked_delay(rec, now):
+    if rec.get("status") == "live" or rec.get("chat"):
+        rec["chat_waits"] = 0
+        return MONITOR_RECHECK_INTERVAL
+    waits = rec.get("chat_waits", 0)
+    rec["chat_waits"] = waits + 1
+    sched = rec.get("scheduled_ts")
+    if sched is not None and sched - now <= 3600:
+        return MONITOR_RECHECK_INTERVAL        # starting within the hour (or overdue): watch closely
+    top = 3 if (sched is not None and sched - now > 86400) else 2
+    return MONITOR_CHAT_WAIT_DELAYS[min(waits, top)]
+
+
+def _mon_apply(vid, rec, item):
+    now = time.time()
+    rec["errors"] = 0
+    tracked = rec.get("state") == "tracked"
+    if item is None:
+        if tracked:
+            rec["missing"] = rec.get("missing", 0) + 1
+            if rec["missing"] >= 2:
+                _mon_mark_ended(vid, rec, "is no longer available")
+            else:
+                rec["next_check"] = now + 60
+        else:
+            _mon_uncertain(vid, rec, now)
+        return
+    rec["missing"] = 0
+    snippet = item.get("snippet") or {}
+    lsd = item.get("liveStreamingDetails")
+    lbc = snippet.get("liveBroadcastContent")
+    title = (snippet.get("title") or "")[:100]
+    cid = snippet.get("channelId") or rec.get("channel_id") or ""
+    if lsd and (lsd.get("actualEndTime") or (lbc == "none" and lsd.get("actualStartTime"))):
+        _mon_mark_ended(vid, rec, "has ended")
+        return
+    if lbc in ("live", "upcoming") and lsd:
+        newly = not tracked
+        sched = _mon_parse_time(lsd.get("scheduledStartTime"))
+        rec.update(state="tracked", status=lbc, title=title or rec.get("title", ""), channel_id=cid,
+                   scheduled_ts=sched, chat=bool(lsd.get("activeLiveChatId")), verified_at=now)
+        rec["next_check"] = now + _mon_next_tracked_delay(rec, now)
+        if newly:
+            with _mon_lock:
+                ch = _mon_channels.get(cid)
+                if ch is not None:
+                    ch["last_found"] = {"id": vid, "title": rec["title"], "at": now, "status": lbc}
+            add_log(f"📡 Monitor: found {lbc} broadcast '{rec['title']}' ({vid}) via {rec.get('source', 'restore')}"
+                    + ("" if rec["chat"] else " — waiting for its chat to open."))
+        return
+    if tracked and lbc in ("live", "upcoming"):
+        rec["next_check"] = now + 60            # livestream details briefly missing: look again soon, don't end it
+        return
+    if tracked:
+        _mon_mark_ended(vid, rec, "is no longer live or scheduled")
+        return
+    if lbc == "none" and not lsd:
+        rec["strikes"] = rec.get("strikes", 0) + 1
+        if rec["strikes"] >= 2:
+            rec["state"] = "ordinary"          # confirmed upload/Short: never checked again
+            rec.pop("next_check", None)
+        else:
+            rec["next_check"] = now + MONITOR_ORDINARY_CONFIRM_DELAY
+        return
+    _mon_uncertain(vid, rec, now)
+
+
+def _mon_verify_due():
+    now = time.time()
+    with _mon_lock:
+        due = [v for v, r in _mon_videos.items() if r.get("state") in ("candidate", "tracked") and r.get("next_check", 0) <= now]
+        due.sort(key=lambda v: (0 if _mon_videos[v]["state"] == "tracked" else 1, _mon_videos[v].get("first_seen", 0)))
+    for i in range(0, min(len(due), MONITOR_VERIFY_BATCH * MONITOR_VERIFY_BATCHES_PER_TICK), MONITOR_VERIFY_BATCH):
+        batch = due[i:i + MONITOR_VERIFY_BATCH]
+        try:
+            resp = call_with_quota_failover(
+                lambda yt: yt.videos().list(part="snippet,liveStreamingDetails", id=",".join(batch)).execute(),
+                "livestream status check",
+            )
+        except AllQuotasExhausted as qe:
+            delay = min(qe.wait_seconds + 5, 3600)
+            for vid in batch:
+                if vid in _mon_videos:
+                    _mon_videos[vid]["next_check"] = time.time() + delay
+            _mon_log_once("general-exhausted", "Monitor: all API quotas are used up. Livestream checks pause until the 00:00 PT reset.")
+            continue
+        except Exception as e:
+            for vid in batch:
+                rec = _mon_videos.get(vid)
+                if rec is not None:
+                    rec["errors"] = rec.get("errors", 0) + 1
+                    rec["next_check"] = time.time() + min(60 * (2 ** rec["errors"]), 1800)
+            add_log(f"Monitor: livestream status check failed ({e}). Backing off and retrying.")
+            continue
+        _mon_clear_once("general-exhausted")
+        items = {it.get("id"): it for it in resp.get("items", []) if it.get("id")}
+        for vid in batch:
+            rec = _mon_videos.get(vid)
+            if rec is not None:
+                try:
+                    _mon_apply(vid, rec, items.get(vid))
+                except Exception as e:
+                    add_log(f"Monitor: error handling video {vid}: {e}")
+
+
+# --- admission: cap, priority, duplicate protection -------------------------
+def _mon_admit():
+    now = time.time()
+    with _mon_lock:
+        cands = [(v, r) for v, r in _mon_videos.items()
+                 if r.get("state") == "tracked" and r.get("verified_at") and not r.get("dismissed") and not r.get("manual")]
+    if not cands:
+        return
+    streams = load_streams()
+    for vid, rec in cands:
+        entry = streams.get(vid)
+        if isinstance(entry, dict) and not entry.get("auto"):
+            rec["manual"] = True                  # added/edited by hand on the Live tab: the monitor never touches it
+        elif rec.get("auto_added") and entry is None:
+            rec["dismissed"] = True               # removed from the Live tab: don't re-add until Start listener is tapped
+            add_log(f"📡 Monitor: '{rec.get('title') or vid}' ({vid}) was removed from the Live tab — it will not be re-added unless you tap Start listener on the Channels tab.")
+    cands = [(v, r) for v, r in cands if not r.get("manual") and not r.get("dismissed")]
+
+    def running_upcoming():
+        return sum(1 for v, r in cands if r.get("status") == "upcoming" and is_stream_running(v))
+
+    cands.sort(key=lambda c: (0 if c[1].get("status") == "live" else 1, c[1].get("scheduled_ts") or 1e18, c[0]))
+    upcoming_running = running_upcoming()
+    started = 0
+    for vid, rec in cands:
+        rec["queued"] = False
+        if not rec.get("chat") or is_stream_running(vid):
+            continue
+        if started >= MONITOR_STARTS_PER_TICK:
+            break
+        if rec.get("status") == "upcoming" and upcoming_running >= MAX_PRESTART_LISTENERS:
+            rec["queued"] = True                  # waits for a free pre-start slot; live broadcasts never wait
+            continue
+        starts = rec.setdefault("starts", [])
+        starts[:] = [t for t in starts if now - t < 3600]
+        if len(starts) >= MONITOR_RESTART_LIMIT:
+            _mon_log_once(f"restart-limit-{vid}", f"Monitor: '{rec.get('title') or vid}' ({vid}) keeps disconnecting; pausing restarts for now.")
+            continue
+        entry = streams.get(vid)
+        if entry is None:
+            label = (rec.get("title") or vid)[:60]
+            streams[vid] = {"label": label, "channel_id": rec.get("channel_id", ""), "auto": True, "source": "monitor"}
+            if not streams[vid]["channel_id"]:
+                streams[vid].pop("channel_id")
+            save_streams(streams)
+        else:
+            label = entry.get("label") or rec.get("title") or vid
+        cid = rec.get("channel_id")
+        if cid and pytchat_manual_channel_patch.is_valid_channel_id(cid):
+            pytchat_manual_channel_patch.set_manual_channel_id(vid, cid)
+        if start_stream_listener(vid, label):
+            rec["auto_added"] = True
+            starts.append(now)
+            started += 1
+            if rec.get("status") == "upcoming":
+                upcoming_running += 1
+            _mon_clear_once(f"restart-limit-{vid}")
+            add_log(f"📡 Monitor: listening to {rec.get('status')} broadcast '{label}' ({vid}).")
+
+
+def _mon_bootstrap(streams):
+    """Auto-added streams saved before a restart are handed back to the monitor (re-verified, then re-admitted under the cap)."""
+    now = time.time()
+    restored = 0
+    with _mon_lock:
+        for vid, data in (streams or {}).items():
+            if isinstance(data, dict) and data.get("auto") and vid not in _mon_videos:
+                _mon_videos[vid] = {
+                    "state": "tracked", "status": "upcoming", "channel_id": data.get("channel_id", ""),
+                    "title": data.get("label", ""), "chat": False, "auto_added": True,
+                    "first_seen": now, "next_check": now, "errors": 0,
+                }
+                restored += 1
+    if restored:
+        add_log(f"Monitor: {restored} auto-added stream(s) from before the restart will be re-verified before reconnecting.")
+
+
+def monitor_loop():
+    add_log(f"📡 Channel monitor started (RSS {MONITOR_RSS_INTERVAL // 60} min, search {MONITOR_SEARCH_INTERVAL // 3600} h, "
+            f"status re-check {MONITOR_RECHECK_INTERVAL // 60} min, pre-start listener cap {MAX_PRESTART_LISTENERS}).")
+    while True:
+        for step in (_mon_sync_channels, _mon_run_rss, _mon_run_search, _mon_verify_due, _mon_admit):
+            try:
+                step()
+            except Exception as e:
+                add_log(f"Monitor error in {step.__name__}: {e}")
+        time.sleep(MONITOR_TICK_SECONDS)
+
+
+def start_channel_monitor(streams):
+    global _mon_thread_started
+    if _mon_thread_started:
+        return
+    _mon_thread_started = True
+    _mon_bootstrap(streams)
+    threading.Thread(target=monitor_loop, daemon=True).start()
+
+
+def monitor_status_snapshot():
+    """Everything the Channels tab shows, as plain JSON-able data."""
+    now = time.time()
+    saved = list_saved_channels()
+    with _mon_lock:
+        by_channel = {}
+        upcoming_running = 0
+        for vid, rec in _mon_videos.items():
+            if rec.get("state") != "tracked":
+                continue
+            running = is_stream_running(vid)
+            if rec.get("manual"):
+                phase = "manual"
+            elif running:
+                phase = "listening"
+            elif rec.get("dismissed"):
+                phase = "dismissed"
+            elif not rec.get("verified_at"):
+                phase = "checking"
+            elif not rec.get("chat"):
+                phase = "waiting_chat"
+            elif rec.get("queued"):
+                phase = "queued"
+            else:
+                phase = "starting"
+            if running and rec.get("status") == "upcoming" and not rec.get("manual"):
+                upcoming_running += 1
+            by_channel.setdefault(rec.get("channel_id", ""), []).append({
+                "id": vid, "title": rec.get("title") or vid, "status": rec.get("status"),
+                "scheduled": rec.get("scheduled_ts"), "phase": phase,
+            })
+        channels = []
+        for c in saved:
+            ch = _mon_channels.get(c["id"]) or {}
+            casts = sorted(by_channel.get(c["id"], []), key=lambda b: (0 if b["status"] == "live" else 1, b["scheduled"] or 1e18))
+            channels.append({
+                "id": c["id"], "name": c["name"], "handle": c["handle"], "monitor": c["monitor"],
+                "last_rss": ch.get("last_rss"), "last_search": ch.get("last_search"),
+                "next_search": ch.get("search_next") if c["monitor"] else None,
+                "rss_err": ch.get("rss_err", ""), "search_note": ch.get("search_note", ""),
+                "last_found": ch.get("last_found"), "broadcasts": casts,
+            })
+        day = datetime.now(_PT_ZONE).strftime("%Y-%m-%d")
+        search_today = {name: _mon_search_counts.get((day, name), 0) for name, _ in _api_clients}
+    with _quota_lock:
+        exhausted = {k: True for k in _quota_exhausted_until}
+    return {
+        "now": now, "cap": MAX_PRESTART_LISTENERS, "prestart_running": upcoming_running,
+        "search_today": search_today, "search_limit": SEARCH_DEFAULT_DAILY_CALLS,
+        "search_exhausted": [n for n, _ in _api_clients if exhausted.get(f"{n}:search")],
+        "channels": channels,
+    }
+
+
 def main():
     """Load saved streams on startup and start a listener for each."""
     add_log("=" * 60)
@@ -4629,8 +5515,12 @@ def main():
             add_log(f"Registered {manual_count} manual channel ID(s) from saved streams.")
 
         for video_id, data in streams.items():
+            if isinstance(data, dict) and data.get('auto'):
+                continue   # v0.3.2.0: auto-added streams are re-verified and reconnected by the channel monitor (respects the pre-start cap)
             label = data.get('label') or video_id
             start_stream_listener(video_id, label)
+
+    start_channel_monitor(streams)
 
     # Keep the main thread alive; the HTTP server and stream listener
     # threads are all daemon threads doing the real work in the background.
