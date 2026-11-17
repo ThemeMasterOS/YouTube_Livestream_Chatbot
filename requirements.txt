@@ -3,5 +3,6 @@ google-auth-oauthlib
 google-auth-httplib2
 python-dotenv
 thememasterchat
-httpx
+httpx==0.23.3
+innertube
 certifi>=2026.10.19
