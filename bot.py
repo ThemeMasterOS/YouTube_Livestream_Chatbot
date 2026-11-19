@@ -1,5 +1,6 @@
 import os
 import copy
+import gc
 import json
 import math
 import re
@@ -5249,6 +5250,43 @@ def _mon_error_text(exc):
     return text[:160]
 
 
+_MON_MALLOC_TRIM = None
+_MON_MALLOC_TRIM_READY = False
+
+
+def _mon_malloc_trim():
+    """Best-effort glibc malloc_trim(0). No-op on platforms without it."""
+    global _MON_MALLOC_TRIM, _MON_MALLOC_TRIM_READY
+    if not _MON_MALLOC_TRIM_READY:
+        _MON_MALLOC_TRIM_READY = True
+        try:
+            import ctypes
+            trim = ctypes.CDLL(None).malloc_trim
+            trim.argtypes = [ctypes.c_size_t]
+            trim.restype = ctypes.c_int
+            _MON_MALLOC_TRIM = trim
+        except Exception:
+            _MON_MALLOC_TRIM = None
+    if _MON_MALLOC_TRIM is not None:
+        try:
+            _MON_MALLOC_TRIM(0)
+        except Exception:
+            pass
+
+
+def _mon_release_memory():
+    """Return the transient JSON/HTTP heap from one browse to the OS.
+
+    Python frees the parsed response immediately, but glibc keeps the freed
+    pages in its arenas. tracemalloc then reports almost no live memory while
+    RSS stays tens of MiB higher, growing again for every new response shape.
+    This is called only after the response object has been deleted, so it can
+    trim that free heap without touching live monitor state.
+    """
+    gc.collect()
+    _mon_malloc_trim()
+
+
 # --- InnerTube (primary discovery) -----------------------------------------
 def _mon_innertube_client():
     """Shared innertube client. Creating it is local work: the WEB context is bundled."""
@@ -5328,55 +5366,68 @@ _MON_ID_EXTRACTORS = (
 
 
 def _mon_collect_video_ids(data):
-    """Every video ID in a browse response, deduped, modern renderers first."""
+    """Every video ID in a browse response, deduped, modern renderers first.
+
+    One tree walk feeds per-renderer buckets, then the buckets are concatenated
+    in extractor order. The old version walked the whole response once per
+    renderer type (four full walks of a multi-MiB channel tab).
+    """
+    buckets = {key: [] for key, _ in _MON_ID_EXTRACTORS}
+    for node in _mon_walk(data):
+        for key, extract in _MON_ID_EXTRACTORS:
+            renderer = node.get(key)
+            if isinstance(renderer, dict):
+                buckets[key].extend(extract(renderer))
     ids = []
     seen = set()
-    for key, extract in _MON_ID_EXTRACTORS:
-        for node in _mon_walk(data):
-            renderer = node.get(key)
-            if not isinstance(renderer, dict):
-                continue
-            for video_id in extract(renderer):
-                if video_id not in seen:
-                    seen.add(video_id)
-                    ids.append(video_id)
+    for key, _ in _MON_ID_EXTRACTORS:
+        for video_id in buckets[key]:
+            if video_id not in seen:
+                seen.add(video_id)
+                ids.append(video_id)
     return ids
 
 
-def _mon_tab_endpoint(data, suffixes):
-    """A channel tab endpoint whose URL ends with one of `suffixes`.
+def _mon_tab_endpoint_url(tab):
+    """The webCommandMetadata URL of one tabRenderer, or ''."""
+    endpoint = tab.get("endpoint")
+    if not isinstance(endpoint, dict):
+        return ""
+    metadata = endpoint.get("commandMetadata")
+    if isinstance(metadata, dict):
+        web = metadata.get("webCommandMetadata")
+        if isinstance(web, dict):
+            return web.get("url") or ""
+    return ""
 
-    Matching is by endpoint URL suffix, never by the localized tab title.
-    """
+
+def _mon_tab_endpoint_info(tab):
+    """The browse request for one tabRenderer, or None."""
+    endpoint = tab.get("endpoint")
+    if not isinstance(endpoint, dict):
+        return None
+    browse = endpoint.get("browseEndpoint")
+    if not isinstance(browse, dict):
+        return None
+    return {"browseId": browse.get("browseId") or "", "params": browse.get("params") or ""}
+
+
+def _mon_tab_endpoints(data):
+    """The Live/Streams and Videos tab endpoints from one root walk."""
+    streams = None
+    videos = None
     for node in _mon_walk(data):
         tab = node.get("tabRenderer")
         if not isinstance(tab, dict):
             continue
-        endpoint = tab.get("endpoint")
-        if not isinstance(endpoint, dict):
-            continue
-        url = ""
-        metadata = endpoint.get("commandMetadata")
-        if isinstance(metadata, dict):
-            web = metadata.get("webCommandMetadata")
-            if isinstance(web, dict):
-                url = web.get("url") or ""
-        if not any(url.endswith(suffix) for suffix in suffixes):
-            continue
-        browse = endpoint.get("browseEndpoint")
-        if isinstance(browse, dict):
-            return {"browseId": browse.get("browseId") or "", "params": browse.get("params") or ""}
-    return None
-
-
-def _mon_streams_tab(data):
-    """The channel's Live/Streams tab endpoint, or None when it has no such tab."""
-    return _mon_tab_endpoint(data, ("/streams", "/live"))
-
-
-def _mon_videos_tab(data):
-    """The channel's Videos tab endpoint (scheduled premieres are listed there)."""
-    return _mon_tab_endpoint(data, ("/videos",))
+        url = _mon_tab_endpoint_url(tab)
+        if streams is None and any(url.endswith(suffix) for suffix in ("/streams", "/live")):
+            streams = _mon_tab_endpoint_info(tab)
+        elif videos is None and url.endswith("/videos"):
+            videos = _mon_tab_endpoint_info(tab)
+        if streams is not None and videos is not None:
+            break
+    return streams, videos
 
 
 def _mon_innertube_browse(channel_id, tab):
@@ -5395,14 +5446,29 @@ def _mon_innertube_browse(channel_id, tab):
 
 def _mon_cache_tabs(channel_id, root, now):
     """Cache a channel's tab endpoints from one root response."""
+    tab, videos = _mon_tab_endpoints(root)
     with _mon_lock:
         previous = _mon_innertube_tabs.get(channel_id) or {}
         _mon_innertube_tabs[channel_id] = {
-            "tab": _mon_streams_tab(root),
-            "videos": _mon_videos_tab(root),
+            "tab": tab,
+            "videos": videos,
             "at": now,
             "premiere_at": previous.get("premiere_at", 0.0),
         }
+
+
+def _mon_read_root_tabs(channel_id, now):
+    """Read a channel root, cache its two tab endpoints, then release it.
+
+    The root response must not stay alive while the Live tab is parsed: that
+    alone puts two multi-MiB JSON trees in memory at the same time.
+    """
+    root = _mon_innertube_browse(channel_id, {"browseId": channel_id})
+    try:
+        _mon_cache_tabs(channel_id, root, now)
+    finally:
+        del root
+        _mon_release_memory()
 
 
 def _mon_innertube_discover(channel_id):
@@ -5416,8 +5482,7 @@ def _mon_innertube_discover(channel_id):
     with _mon_lock:
         cached = _mon_innertube_tabs.get(channel_id)
     if cached is None or now - cached.get("at", 0) >= MONITOR_TAB_CACHE_SECONDS:
-        root = _mon_innertube_browse(channel_id, {"browseId": channel_id})
-        _mon_cache_tabs(channel_id, root, now)
+        _mon_read_root_tabs(channel_id, now)
         with _mon_lock:
             tab = (_mon_innertube_tabs.get(channel_id) or {}).get("tab")
     else:
@@ -5430,14 +5495,17 @@ def _mon_innertube_discover(channel_id):
         # Cached tab params can go stale; re-read the channel root once.
         with _mon_lock:
             _mon_innertube_tabs.pop(channel_id, None)
-        root = _mon_innertube_browse(channel_id, {"browseId": channel_id})
-        _mon_cache_tabs(channel_id, root, time.time())
+        _mon_read_root_tabs(channel_id, time.time())
         with _mon_lock:
             tab = (_mon_innertube_tabs.get(channel_id) or {}).get("tab")
         if tab is None:
             return []
         data = _mon_innertube_browse(channel_id, tab)
-    return _mon_collect_video_ids(data)
+    try:
+        return _mon_collect_video_ids(data)
+    finally:
+        del data
+        _mon_release_memory()
 
 
 def _mon_premiere_discover(channel_id):
@@ -5469,7 +5537,11 @@ def _mon_premiere_discover(channel_id):
             if entry is not None:
                 entry["premiere_at"] = time.time() + 3600   # retry in an hour, not every check
         raise
-    return _mon_collect_video_ids(data)[:MONITOR_PREMIERE_SCAN_LIMIT]
+    try:
+        return _mon_collect_video_ids(data)[:MONITOR_PREMIERE_SCAN_LIMIT]
+    finally:
+        del data
+        _mon_release_memory()
 
 
 def _mon_premiere_scan(channel_id):
