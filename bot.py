@@ -54,6 +54,16 @@ def _env_number(name, default, cast, minimum):
 
 MAX_CONCURRENT_CONNECTS = _env_number("MAX_CONCURRENT_CONNECTS", 2, int, 1)
 CONNECT_MIN_SPACING = _env_number("CONNECT_MIN_SPACING", 2.0, float, 0.0)  # seconds between attempt starts
+
+# ChatMBR (!chatmbr / !ai) endpoint and tone. CHATMBR_PERSONALITY is one of
+# friendly | energetic | professional | funny; anything else falls back to
+# friendly, which is also the server's own default.
+CHATMBR_API_URL = "http://217.154.36.84:7264/api/chat"
+CHATMBR_PERSONALITIES = ("friendly", "energetic", "professional", "funny")
+
+# v0.3.3.0: one "Memory:" line in the logs every MEMORY_LOG_INTERVAL seconds
+# (RSS, threads, listeners, record counts). Set MEMORY_LOG_INTERVAL=0 to turn it off.
+MEMORY_LOG_INTERVAL = _env_number("MEMORY_LOG_INTERVAL", 600, int, 0)
 CONNECT_QUEUE_LOG_THRESHOLD = 5  # seconds; log "got a slot" only if the wait was longer than this
 
 
@@ -841,6 +851,7 @@ def _default_blocklist_category(name=""):
         "timeout_seconds": DEFAULT_TIMEOUT_SECONDS,
         "timeout_message": DEFAULT_BLOCKLIST_TIMEOUT_MESSAGE,
         "reminder_message": DEFAULT_BLOCKLIST_REMINDER_MESSAGE,
+        "exceptions": [],
     }
 
 
@@ -913,7 +924,7 @@ def get_stream_moderation_settings(config, video_id):
     return None
 
 
-def check_blocklist_categories(config, lower_msg):
+def check_blocklist_categories(config, lower_msg, creator_channel_id=None):
     """
     Checks a lowercased message against every blocklist category (global,
     applies to all streams). Returns the first matching category's settings
@@ -927,8 +938,14 @@ def check_blocklist_categories(config, lower_msg):
     inside "passeando" or "class". \\b treats each blocked entry as its own
     word (or exact phrase, for multi-word entries), bounded by whitespace,
     punctuation, or the start/end of the message.
+
+    v0.3.3.0: creator_channel_id is the channel hosting the stream. A category
+    that lists it under "exceptions" is skipped for that stream, so another
+    category can still match. None (the default) skips nothing.
     """
     for category in config.get("blocklist_categories", {}).values():
+        if creator_channel_id and creator_channel_id in (category.get("exceptions") or ()):
+            continue
         for bad_word in category.get("words", []):
             bad_word = bad_word.strip().lower()
             if not bad_word:
@@ -937,6 +954,120 @@ def check_blocklist_categories(config, lower_msg):
             if re.search(pattern, lower_msg):
                 return category
     return None
+
+
+def stream_channel_id(video_id):
+    """
+    v0.3.3.0: the creator channel (UC...) hosting a stream, or "" if unknown.
+    Reads the in-memory caches directly (no copy, no file/GitHub access), so it
+    is cheap enough to call for every chat message.
+    """
+    cid = ""
+    with _streams_cache_lock:
+        entry = (_streams_cache or {}).get(video_id)
+        if isinstance(entry, dict):
+            cid = str(entry.get("channel_id") or "")
+    if not cid and _mon_lock.acquire(timeout=0.25):   # never let a busy monitor stall chat handling
+        try:
+            cid = str((_mon_videos.get(video_id) or {}).get("channel_id") or "")
+        finally:
+            _mon_lock.release()
+    return cid
+
+
+EXCEPTIONS_UI_HTML = '''
+<div class="exc-overlay" id="excOverlay" hidden role="dialog" aria-modal="true" aria-labelledby="excTitle">
+  <div class="exc-panel">
+    <h3 id="excTitle">Exceptions</h3>
+    <p class="note" id="excSub"></p>
+    <input type="text" id="excSearch" placeholder="Search channels..." oninput="excFilter()" autocomplete="off">
+    <div class="exc-list" id="excList"></div>
+    <p class="note">Matches the channel that hosts the stream. A manual Live-tab stream only matches if its channel ID is set.</p>
+    <div class="exc-actions">
+      <button type="button" class="save-btn" onclick="saveExceptions()">Save Exceptions</button>
+      <button type="button" onclick="closeExceptions()">Cancel</button>
+    </div>
+  </div>
+</div>
+'''
+
+EXCEPTIONS_UI_CSS = '''
+.exc-overlay{position:fixed;inset:0;z-index:1000;display:flex;align-items:center;justify-content:center;padding:16px;background:rgba(0,0,0,.55)}
+.exc-overlay[hidden]{display:none}
+.exc-panel{background:var(--surface);color:var(--ink);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);width:100%;max-width:520px;max-height:85vh;display:flex;flex-direction:column;gap:10px;padding:16px}
+.exc-panel h3{margin:0}
+.exc-panel .note{margin:0}
+.exc-list{overflow:auto;border:1px solid var(--line);border-radius:10px;background:var(--bg);min-height:80px}
+.exc-row{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border-bottom:1px solid var(--line);cursor:pointer}
+.exc-row:last-child{border-bottom:0}
+.exc-row input{width:20px;height:20px;margin:2px 0 0;accent-color:var(--accent);flex:none}
+.exc-row b{display:block;word-break:break-word}
+.exc-row small{color:var(--muted);word-break:break-all}
+.exc-row.gone b{color:var(--warn)}
+.exc-empty{padding:14px;color:var(--muted)}
+.exc-actions{display:flex;gap:8px;flex-wrap:wrap}
+'''
+
+EXCEPTIONS_UI_JS = r'''
+var __excScope = null;
+function excEsc(s) {
+  return String(s).replace(/[&<>"']/g, function (c) { return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]; });
+}
+function openExceptions(scope) {
+  var d = window.__EXC__ || {channels: [], scopes: {}, titles: {}};
+  __excScope = scope;
+  document.getElementById('excTitle').textContent = 'Exceptions: ' + (d.titles[scope] || scope);
+  document.getElementById('excSub').textContent = scope === 'all_streams'
+    ? 'Streams hosted by the ticked channels skip the All-Streams spam check.'
+    : 'Streams hosted by the ticked channels skip this blocklist category.';
+  var selected = {};
+  (d.scopes[scope] || []).forEach(function (id) { selected[id] = true; });
+  var known = {}, rows = [];
+  (d.channels || []).forEach(function (c) { known[c.id] = true; rows.push(c); });
+  Object.keys(selected).forEach(function (id) { if (!known[id]) rows.push({id: id, name: '', handle: '', gone: true}); });
+  var list = document.getElementById('excList');
+  if (!rows.length) {
+    list.innerHTML = '<div class="exc-empty">No saved channels yet. Add channels on the Channels tab first.</div>';
+  } else {
+    list.innerHTML = rows.map(function (c) {
+      var title = c.name || c.handle || c.id;
+      var sub = (title === c.id) ? '' : [(c.name && c.handle) ? c.handle : '', c.id].filter(Boolean).join(' \u00b7 ');
+      var hay = (c.name + ' ' + c.handle + ' ' + c.id).toLowerCase();
+      return '<label class="exc-row' + (c.gone ? ' gone' : '') + '" data-hay="' + excEsc(hay) + '">' +
+        '<input type="checkbox" value="' + excEsc(c.id) + '"' + (selected[c.id] ? ' checked' : '') + '>' +
+        '<span><b>' + excEsc(title) + (c.gone ? ' (no longer on the Channels tab)' : '') + '</b><small>' + excEsc(sub) + '</small></span></label>';
+    }).join('');
+  }
+  document.getElementById('excSearch').value = '';
+  document.getElementById('excOverlay').hidden = false;
+}
+function excFilter() {
+  var q = document.getElementById('excSearch').value.toLowerCase().trim();
+  document.querySelectorAll('#excList .exc-row').forEach(function (r) {
+    r.style.display = (!q || r.dataset.hay.indexOf(q) !== -1) ? '' : 'none';
+  });
+}
+function closeExceptions() {
+  var ov = document.getElementById('excOverlay');
+  if (ov) ov.hidden = true;
+}
+function saveExceptions() {
+  var ids = Array.prototype.map.call(document.querySelectorAll('#excList input[type=checkbox]:checked'), function (el) { return el.value; });
+  fetch('/api/moderation/exceptions', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({scope: __excScope, channels: ids})
+  }).then(function (r) { return r.json(); }).then(function (data) {
+    alert(data.message);
+    closeExceptions();
+    refreshModeration();
+  }).catch(function () { alert('Could not save exceptions.'); });
+}
+if (!window.__excKeyBound) {
+  window.__excKeyBound = true;
+  document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeExceptions(); });
+}
+'''
 
 
 def make_user_key(userName, userChannelId):
@@ -1653,7 +1784,7 @@ CHANNEL_UI_JS = r"""
 # The shell is a plain (non-f) string; __BOOT__ becomes JSON (admin flag, commands, counts).
 # Channels, Live and Moderation are served as fragments (/_view/channels, /_view/live, /_view/moderation) and run inside the shell.
 # ---------------------------------------------------------------------------
-BOT_VERSION = "0.3.2.0"
+BOT_VERSION = "0.3.3.0"
 BOT_STARTED_AT = time.time()
 DASHBOARD_PAGES = ("home", "commands", "leaderboard", "logs", "channels", "live", "moderation", "themes")
 
@@ -2952,6 +3083,18 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
 
         all_streams_settings = config.get("all_streams", _default_stream_moderation())
 
+        # v0.3.3.0: data for the Exceptions dialog (saved Channels-tab channels + current lists).
+        exc_scopes = {"all_streams": list(all_streams_settings.get("exceptions") or [])}
+        exc_titles = {"all_streams": "All-Streams spam"}
+        for _cat_id, _cat in config.get("blocklist_categories", {}).items():
+            exc_scopes[_cat_id] = list(_cat.get("exceptions") or [])
+            exc_titles[_cat_id] = _cat.get("name") or "Untitled"
+        exc_json = (json.dumps({
+            "channels": [{"id": c["id"], "name": c.get("name", ""), "handle": c.get("handle", "")} for c in list_saved_channels()],
+            "scopes": exc_scopes,
+            "titles": exc_titles,
+        }, ensure_ascii=False).replace("<", "\\u003c").replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
+
         stream_rows = ""
         i = 0
         for video_id, data in streams.items():
@@ -2990,6 +3133,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                     <label>Reminder message (use {{userName}})</label>
                     <textarea class="cat-reminder-msg">{esc(category.get('reminder_message', DEFAULT_BLOCKLIST_REMINDER_MESSAGE))}</textarea>
                     <button class="save-btn" onclick="saveBlocklistCategory('{js_arg(cat_id)}')">Save Category</button>
+                    <button class="exc-btn" onclick="openExceptions('{js_arg(cat_id)}')">Exceptions ({len(category.get('exceptions') or [])})</button>
                     <button class="delete-btn" onclick="deleteBlocklistCategory('{js_arg(cat_id)}')">Delete Category</button>
                 </div>
                 """
@@ -3022,6 +3166,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                         <label>Reminder message (use {{userName}})</label>
                         <textarea id="allStreamsReminderMsg">{esc(all_streams_settings.get('reminder_message', DEFAULT_REMINDER_MESSAGE))}</textarea>
                         <button class="save-btn" onclick="saveAllStreamsSettings()">Save All-Streams Settings</button>
+                        <button class="exc-btn" onclick="openExceptions('all_streams')">Exceptions ({len(all_streams_settings.get('exceptions') or [])})</button>
                     </div>
 
                     <div class="box">
@@ -3122,6 +3267,10 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                         }}).then(r => r.json()).then(data => alert(data.message));
                     }}
                 </script>
+                <style>{EXCEPTIONS_UI_CSS}</style>
+                <script>window.__EXC__ = {exc_json};</script>
+{EXCEPTIONS_UI_HTML}
+                <script>{EXCEPTIONS_UI_JS}</script>
 </div>
 """
 
@@ -3411,6 +3560,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                     "timeout_seconds": DEFAULT_TIMEOUT_SECONDS,
                     "timeout_message": DEFAULT_BLOCKLIST_TIMEOUT_MESSAGE,
                     "reminder_message": DEFAULT_BLOCKLIST_REMINDER_MESSAGE,
+                    "exceptions": [],
                 }
                 save_moderation(config)
                 message = "New blocklist category created."
@@ -3429,6 +3579,8 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                     "timeout_seconds": int(body.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)),
                     "timeout_message": body.get("timeout_message", DEFAULT_BLOCKLIST_TIMEOUT_MESSAGE),
                     "reminder_message": body.get("reminder_message", DEFAULT_BLOCKLIST_REMINDER_MESSAGE),
+                    # v0.3.3.0: the form never carries the exception list, so keep the saved one.
+                    "exceptions": list(config["blocklist_categories"][category_id].get("exceptions") or []),
                 }
                 save_moderation(config)
                 message = f"Blocklist category '{config['blocklist_categories'][category_id]['name']}' saved."
@@ -3451,6 +3603,36 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({"message": message}).encode("utf-8"))
 
+        elif self.path == "/api/moderation/exceptions" and self.command == "POST":
+            # v0.3.3.0: creator channels (from the Channels tab) whose streams skip one blocklist
+            # category, or the All-Streams spam check. Sudo-guarded by the default-deny in do_GET.
+            content_length = min(int(self.headers.get('Content-Length', 0)), 65536)
+            body = json.loads(self.rfile.read(content_length).decode('utf-8'))
+            scope = str(body.get("scope", ""))
+            raw_channels = body.get("channels", [])
+            if not isinstance(raw_channels, list):
+                self._send_json(400, {"message": "channels must be a list."})
+                return
+            channel_ids = []
+            for raw_id in raw_channels:
+                cid = str(raw_id).strip()
+                if pytchat_manual_channel_patch.is_valid_channel_id(cid) and cid not in channel_ids:
+                    channel_ids.append(cid)
+            channel_ids = channel_ids[:500]
+
+            config = load_moderation()
+            if scope == "all_streams":
+                config.setdefault("all_streams", _default_stream_moderation())["exceptions"] = channel_ids
+                label = "All-Streams spam"
+            elif scope in config.get("blocklist_categories", {}):
+                config["blocklist_categories"][scope]["exceptions"] = channel_ids
+                label = f"blocklist category '{config['blocklist_categories'][scope].get('name', 'Untitled')}'"
+            else:
+                self._send_json(404, {"message": "Category not found."})
+                return
+            save_moderation(config)
+            self._send_json(200, {"message": f"Exceptions saved for {label}: {len(channel_ids)} channel(s)."})
+
         elif self.path == "/api/moderation/all-streams" and self.command == "POST":
             content_length = int(self.headers.get('Content-Length', 0))
             body = json.loads(self.rfile.read(content_length).decode('utf-8'))
@@ -3458,6 +3640,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             config = load_moderation()
             existing = config.get("all_streams", _default_stream_moderation())
             config["all_streams"] = {
+                "exceptions": list(existing.get("exceptions") or []),   # v0.3.3.0: kept across saves
                 "enabled": bool(body.get("enabled", False)),
                 "spam_threshold": int(body.get("spam_threshold", DEFAULT_SPAM_THRESHOLD)),
                 "timeout_seconds": int(body.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)),
@@ -3921,11 +4104,17 @@ def run_moderation_check(video_id, stream_name, liveChatId, userName, userChanne
     config = load_moderation()
     lower_msg = message_text.strip().lower()
 
+    # v0.3.3.0: the creator channel hosting this stream may be an exception.
+    creator_channel_id = stream_channel_id(video_id)
+
     # --- Check blocklist categories first (global, always active) ---
-    matched_category = check_blocklist_categories(config, lower_msg)
+    matched_category = check_blocklist_categories(config, lower_msg, creator_channel_id)
 
     # --- Check spam-repeat (only if this stream has spam detection enabled) ---
     spam_settings = get_stream_moderation_settings(config, video_id)
+    if (spam_settings is not None and spam_settings is config.get("all_streams")
+            and creator_channel_id and creator_channel_id in (spam_settings.get("exceptions") or ())):
+        spam_settings = None   # exception list of the All-Streams settings: no spam detection for this creator channel
     is_spam = False
     if spam_settings is not None:
         # Messages starting with "!" are bot commands (!gamble, !coins, ...)
@@ -4396,7 +4585,13 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
             try:
                 encoded_query = urllib.parse.quote(query)
                 encoded_user = urllib.parse.quote(userName)
-                api_url = f"https://chatmbr-bot.vercel.app/api/chat?platform=YouTube&user={encoded_user}&limit=200&query={encoded_query}"
+                api_url = f"{CHATMBR_API_URL}?platform=YouTube&user={encoded_user}&limit=200&query={encoded_query}"
+                # Stream context: the Live-tab label (the video title for auto-added streams).
+                if stream_name and stream_name != "?":
+                    api_url += "&title=" + urllib.parse.quote(str(stream_name)[:80])
+                personality = os.getenv("CHATMBR_PERSONALITY", "friendly").strip().lower()
+                if personality in CHATMBR_PERSONALITIES and personality != "friendly":
+                    api_url += "&personality=" + personality
                 req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
                 with urllib.request.urlopen(req, timeout=8) as api_response:
                     api_reply = api_response.read().decode("utf-8").strip()
@@ -4987,7 +5182,7 @@ MONITOR_INNERTUBE_BACKOFF_MAX = 30 * 60     # cap for repeated breaker failures
 MONITOR_INNERTUBE_RECOVERY_WINDOW = 15 * 60 # gradual switch-back ramp after recovery
 MONITOR_INNERTUBE_RECOVERY_PER_TICK = 2     # InnerTube probes per tick while recovering
 MONITOR_TAB_CACHE_SECONDS = 6 * 60 * 60     # re-read a channel's tab list this often
-MONITOR_PREMIERE_SCAN_INTERVAL = 6 * 60 * 60 # scan a channel's Videos tab this often
+MONITOR_PREMIERE_SCAN_INTERVAL = 2 * 60 * 60 # scan a channel's Videos tab this often
 MONITOR_PREMIERE_SCAN_LIMIT = 30            # newest Videos-tab IDs handed to videos.list
 MONITOR_SEARCH_INTERVAL = 300               # one fallback search.list request per 5 minutes
 MONITOR_RECHECK_INTERVAL = 300              # seconds, tracked broadcasts
@@ -5935,6 +6130,55 @@ def start_channel_monitor(streams):
     threading.Thread(target=monitor_loop, daemon=True).start()
 
 
+def _read_rss_mib():
+    """Resident memory in MiB from /proc (Linux), or None where that is unavailable."""
+    try:
+        with open("/proc/self/status", encoding="ascii", errors="ignore") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024.0
+    except Exception:
+        pass
+    return None
+
+
+def memory_log_line():
+    """v0.3.3.0: one-line health report: memory, threads, listeners and in-memory record counts."""
+    rss = _read_rss_mib()
+    with active_streams_lock:
+        listeners = len(active_stream_ids)
+    with _mon_lock:
+        upcoming_auto = [v for v, r in _mon_videos.items() if r.get("auto_added") and r.get("status") == "upcoming"]
+        records = len(_mon_videos)
+    prestart = sum(1 for v in upcoming_auto if is_stream_running(v))
+    with _moderation_state_lock:
+        mod_entries = sum(len(users) for table in (_recent_messages, _offense_counts, _recently_timed_out) for users in table.values())
+    rss_text = f"{rss:.1f} MiB RSS" if rss is not None else "RSS n/a"
+    return (f"🧠 Memory: {rss_text} · {threading.active_count()} threads · {listeners} listeners "
+            f"({prestart} pre-start) · monitor records {records} · moderation entries {mod_entries}")
+
+
+def memory_log_loop():
+    time.sleep(60)   # let startup settle before the first line
+    while True:
+        try:
+            add_log(memory_log_line())
+        except Exception as e:
+            add_log(f"Memory log line failed: {e}")
+        time.sleep(MEMORY_LOG_INTERVAL)
+
+
+_memory_log_started = False
+
+
+def start_memory_log():
+    global _memory_log_started
+    if _memory_log_started or MEMORY_LOG_INTERVAL <= 0:
+        return
+    _memory_log_started = True
+    threading.Thread(target=memory_log_loop, daemon=True).start()
+
+
 def monitor_status_snapshot():
     """Everything the Channels tab shows, as plain JSON-able data."""
     now = time.time()
@@ -6053,11 +6297,15 @@ def main():
             start_stream_listener(video_id, label)
 
     start_channel_monitor(streams)
+    start_memory_log()   # v0.3.3.0: periodic "Memory:" log line (MEMORY_LOG_INTERVAL, 0 = off)
 
     # Keep the main thread alive; the HTTP server and stream listener
     # threads are all daemon threads doing the real work in the background.
-    while True:
-        time.sleep(60)
+    try:
+        while True:
+            time.sleep(60)
+    except KeyboardInterrupt:   # Ctrl+C / the panel's Stop button: log one line and exit (keep this fast)
+        add_log("🛑 Shutting down...")
 
 
 if __name__ == "__main__":
