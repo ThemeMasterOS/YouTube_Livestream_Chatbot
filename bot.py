@@ -59,7 +59,8 @@ CONNECT_MIN_SPACING = _env_number("CONNECT_MIN_SPACING", 2.0, float, 0.0)  # sec
 # ChatMBR (!chatmbr / !ai) endpoint and tone. CHATMBR_PERSONALITY is one of
 # friendly | energetic | professional | funny; anything else falls back to
 # friendly, which is also the server's own default.
-CHATMBR_API_URL = "http://217.154.36.84:7264/api/chat"
+# CHATMBR_API_URL can be overridden in .env (e.g. to switch between Vercel and SillyDev).
+CHATMBR_API_URL = os.getenv("CHATMBR_API_URL", "https://chatmbr-bot.vercel.app/api/chat").strip()
 CHATMBR_PERSONALITIES = ("friendly", "energetic", "professional", "funny")
 CONNECT_QUEUE_LOG_THRESHOLD = 5  # seconds; log "got a slot" only if the wait was longer than this
 
@@ -4590,7 +4591,7 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
                 if personality in CHATMBR_PERSONALITIES and personality != "friendly":
                     api_url += "&personality=" + personality
                 req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=8) as api_response:
+                with urllib.request.urlopen(req, timeout=12) as api_response:
                     api_reply = api_response.read().decode("utf-8").strip()
 
                 if len(api_reply) > 200:
