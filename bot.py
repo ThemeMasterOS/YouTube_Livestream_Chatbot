@@ -60,10 +60,6 @@ CONNECT_MIN_SPACING = _env_number("CONNECT_MIN_SPACING", 2.0, float, 0.0)  # sec
 # friendly, which is also the server's own default.
 CHATMBR_API_URL = "http://217.154.36.84:7264/api/chat"
 CHATMBR_PERSONALITIES = ("friendly", "energetic", "professional", "funny")
-
-# v0.3.3.0: one "Memory:" line in the logs every MEMORY_LOG_INTERVAL seconds
-# (RSS, threads, listeners, record counts). Set MEMORY_LOG_INTERVAL=0 to turn it off.
-MEMORY_LOG_INTERVAL = _env_number("MEMORY_LOG_INTERVAL", 600, int, 0)
 CONNECT_QUEUE_LOG_THRESHOLD = 5  # seconds; log "got a slot" only if the wait was longer than this
 
 
@@ -6130,55 +6126,6 @@ def start_channel_monitor(streams):
     threading.Thread(target=monitor_loop, daemon=True).start()
 
 
-def _read_rss_mib():
-    """Resident memory in MiB from /proc (Linux), or None where that is unavailable."""
-    try:
-        with open("/proc/self/status", encoding="ascii", errors="ignore") as f:
-            for line in f:
-                if line.startswith("VmRSS:"):
-                    return int(line.split()[1]) / 1024.0
-    except Exception:
-        pass
-    return None
-
-
-def memory_log_line():
-    """v0.3.3.0: one-line health report: memory, threads, listeners and in-memory record counts."""
-    rss = _read_rss_mib()
-    with active_streams_lock:
-        listeners = len(active_stream_ids)
-    with _mon_lock:
-        upcoming_auto = [v for v, r in _mon_videos.items() if r.get("auto_added") and r.get("status") == "upcoming"]
-        records = len(_mon_videos)
-    prestart = sum(1 for v in upcoming_auto if is_stream_running(v))
-    with _moderation_state_lock:
-        mod_entries = sum(len(users) for table in (_recent_messages, _offense_counts, _recently_timed_out) for users in table.values())
-    rss_text = f"{rss:.1f} MiB RSS" if rss is not None else "RSS n/a"
-    return (f"🧠 Memory: {rss_text} · {threading.active_count()} threads · {listeners} listeners "
-            f"({prestart} pre-start) · monitor records {records} · moderation entries {mod_entries}")
-
-
-def memory_log_loop():
-    time.sleep(60)   # let startup settle before the first line
-    while True:
-        try:
-            add_log(memory_log_line())
-        except Exception as e:
-            add_log(f"Memory log line failed: {e}")
-        time.sleep(MEMORY_LOG_INTERVAL)
-
-
-_memory_log_started = False
-
-
-def start_memory_log():
-    global _memory_log_started
-    if _memory_log_started or MEMORY_LOG_INTERVAL <= 0:
-        return
-    _memory_log_started = True
-    threading.Thread(target=memory_log_loop, daemon=True).start()
-
-
 def monitor_status_snapshot():
     """Everything the Channels tab shows, as plain JSON-able data."""
     now = time.time()
@@ -6297,7 +6244,6 @@ def main():
             start_stream_listener(video_id, label)
 
     start_channel_monitor(streams)
-    start_memory_log()   # v0.3.3.0: periodic "Memory:" log line (MEMORY_LOG_INTERVAL, 0 = off)
 
     # Keep the main thread alive; the HTTP server and stream listener
     # threads are all daemon threads doing the real work in the background.
