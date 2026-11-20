@@ -18,7 +18,10 @@ after the automatic lookups fail.
 v0.2.0: the oEmbed lookup was removed from this file, because ThemeMasterChat
 now does it natively. Nothing else changed.
 
-v0.1.2 helpers for the bot's "Select Channel" list on /live (unchanged):
+Handles may now contain letters from any alphabet (e.g. @ApG-DØSI-MYSTERKER-l9x),
+not just A-Z: the old ASCII-only check rejected them before any lookup happened.
+
+v0.1.2 helpers for the bot's "Select Channel" list on /live:
   - parse_channel_input(text): classifies what was typed as a channel ID,
     an @handle, or a youtube.com URL containing either.
   - resolve_handle_to_channel_id(handle): turns an @handle into a channel ID
@@ -33,6 +36,7 @@ or constructing any pytchat chat object.
 import html as _html
 import re
 import threading
+import unicodedata
 import httpx
 from urllib.parse import quote, unquote
 
@@ -115,8 +119,31 @@ def patched_get_channelid(client, video_id):
 # v0.1.2: handle / channel-ID input helpers for the bot's saved-channel list
 # ---------------------------------------------------------------------------
 
-# YouTube handles: 3-30 characters of letters, digits, '.', '_' or '-'.
-_HANDLE_RE = re.compile(r"^@?([A-Za-z0-9._-]{3,30})$")
+# YouTube handles: 3-30 characters. Letters and digits of ANY alphabet are allowed
+# (not only A-Z), plus combining marks (needed by scripts such as Hindi and Thai),
+# '.', '_', '-' and the Latin middle dot.
+_HANDLE_EXTRA_CHARS = "._-\u00b7"
+
+
+def _is_handle_name(name) -> bool:
+    if not isinstance(name, str) or not 3 <= len(name) <= 30:
+        return False
+    for c in name:
+        if c in _HANDLE_EXTRA_CHARS:
+            continue
+        cat = unicodedata.category(c)
+        if cat[0] == "L" or cat == "Nd" or cat[0] == "M":
+            continue
+        return False
+    return True
+
+
+def _strip_handle(text):
+    """The handle without its leading '@' if `text` is a valid handle (the '@' is optional), else None."""
+    if not isinstance(text, str):
+        return None
+    name = text[1:] if text.startswith("@") else text
+    return name if _is_handle_name(name) else None
 
 # A desktop-style request plus a consent cookie, so Google's EU-style consent
 # interstitial is less likely to replace the channel page.
@@ -160,9 +187,9 @@ def parse_channel_input(text):
             return ("id", m.group(1))
         m = re.search(r"/@([^/?#\s]+)", s)
         if m:
-            handle = unquote(m.group(1))
-            if _HANDLE_RE.match(handle):
-                return ("handle", "@" + handle.lstrip("@"))
+            name = _strip_handle(unquote(m.group(1)))
+            if name is not None:
+                return ("handle", "@" + name)
         return (None, "")
 
     # Something that looks like a (malformed) channel ID shouldn't be
@@ -170,9 +197,9 @@ def parse_channel_input(text):
     if "@" not in s and s.startswith("UC") and len(s) >= 20:
         return (None, "")
 
-    m = _HANDLE_RE.match(s)
-    if m:
-        return ("handle", "@" + m.group(1))
+    name = _strip_handle(s)
+    if name is not None:
+        return ("handle", "@" + name)
     return (None, "")
 
 
@@ -185,7 +212,7 @@ def resolve_handle_to_channel_id(handle: str):
     or None if the page couldn't be fetched or no ID was found in it.
     """
     handle = "@" + (handle or "").lstrip("@")
-    if not _HANDLE_RE.match(handle):
+    if _strip_handle(handle) is None:
         return None
 
     url = f"https://www.youtube.com/{quote(handle, safe='@')}/about"
