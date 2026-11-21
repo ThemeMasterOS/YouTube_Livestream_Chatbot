@@ -1782,7 +1782,7 @@ CHANNEL_UI_JS = r"""
 # The shell is a plain (non-f) string; __BOOT__ becomes JSON (admin flag, commands, counts).
 # Channels, Live and Moderation are served as fragments (/_view/channels, /_view/live, /_view/moderation) and run inside the shell.
 # ---------------------------------------------------------------------------
-BOT_VERSION = "0.3.3.0"
+BOT_VERSION = "0.3.3.1"
 BOT_STARTED_AT = time.time()
 DASHBOARD_PAGES = ("home", "commands", "leaderboard", "logs", "channels", "live", "moderation", "themes")
 
@@ -4038,6 +4038,51 @@ _moderation_state_lock = threading.Lock()
 MOD_MESSAGE_COOLDOWN_SECONDS = 10
 POST_TIMEOUT_SKIP_SECONDS = 20  # Short buffer, not the real ban duration —
                                  # see _recently_timed_out note above for why.
+MODERATION_PRUNE_EVERY_PASSES = 10       # main()'s keep-alive loop sleeps 60 s: sweep every 10th pass (10 minutes)
+MODERATION_IDLE_GRACE_SECONDS = 60 * 60  # delete a video's moderation state after 60 minutes with no active listener
+
+_moderation_idle_since = {}  # video_id -> first time the sweep saw it with no active listener
+
+
+def prune_moderation_state(now=None):
+    """
+    Delete moderation state for video IDs that have had no active listener for
+    MODERATION_IDLE_GRACE_SECONDS, so a long-running bot doesn't keep per-video
+    tables forever.
+
+    _moderation_state_lock is a plain (non-reentrant) Lock, so it is taken
+    exactly once here and nothing called while it is held takes it again.
+    No other code path holds it while taking active_streams_lock, so the two
+    can be taken in this order safely: a listener that (re)starts while the
+    sweep is running either was already counted as active or starts after the
+    sweep finishes, and its offense counters are never reset. Returns the
+    number of video IDs pruned.
+    """
+    if now is None:
+        now = time.time()
+    tables = (_recent_messages, _offense_counts, _recently_timed_out,
+              _last_mod_owner_reminder_time, _last_mod_request_time)
+    pruned = 0
+    with active_streams_lock:
+        active = set(active_stream_ids)
+        with _moderation_state_lock:
+            video_ids = set()
+            for table in tables:
+                video_ids.update(table.keys())
+            for video_id in active:
+                _moderation_idle_since.pop(video_id, None)   # active again: restart the idle clock
+            for video_id in video_ids:
+                if video_id in active:
+                    continue
+                first_idle = _moderation_idle_since.get(video_id)
+                if first_idle is None:
+                    _moderation_idle_since[video_id] = now
+                elif now - first_idle >= MODERATION_IDLE_GRACE_SECONDS:
+                    for table in tables:
+                        table.pop(video_id, None)
+                    _moderation_idle_since.pop(video_id, None)
+                    pruned += 1
+    return pruned
 
 
 def _send_mod_request(video_id, liveChatId, stream_name):
@@ -6067,6 +6112,7 @@ def _mon_verify_due():
     with _mon_lock:
         due = [v for v, r in _mon_videos.items() if r.get("state") in ("candidate", "tracked") and r.get("next_check", 0) <= now]
         due.sort(key=lambda v: (0 if _mon_videos[v]["state"] == "tracked" else 1, _mon_videos[v].get("first_seen", 0)))
+    fetched = False
     for i in range(0, min(len(due), MONITOR_VERIFY_BATCH * MONITOR_VERIFY_BATCHES_PER_TICK), MONITOR_VERIFY_BATCH):
         batch = due[i:i + MONITOR_VERIFY_BATCH]
         try:
@@ -6089,6 +6135,7 @@ def _mon_verify_due():
                     rec["next_check"] = time.time() + min(60 * (2 ** rec["errors"]), 1800)
             add_log(f"Monitor: livestream status check failed ({e}). Backing off and retrying.")
             continue
+        fetched = True
         _mon_clear_once("general-exhausted")
         items = {it.get("id"): it for it in resp.get("items", []) if it.get("id")}
         for vid in batch:
@@ -6098,6 +6145,12 @@ def _mon_verify_due():
                     _mon_apply(vid, rec, items.get(vid))
                 except Exception as e:
                     add_log(f"Monitor: error handling video {vid}: {e}")
+    if fetched:
+        # Once per tick, after every batch: free the last response and its item
+        # data, then trim the heap left behind by the JSON parsing.
+        del resp
+        del items
+        _mon_release_memory()
 
 
 # --- admission: cap, priority, duplicate protection -------------------------
@@ -6321,8 +6374,15 @@ def main():
     # Keep the main thread alive; the HTTP server and stream listener
     # threads are all daemon threads doing the real work in the background.
     try:
+        keepalive_passes = 0
         while True:
             time.sleep(60)
+            keepalive_passes += 1
+            if keepalive_passes % MODERATION_PRUNE_EVERY_PASSES == 0:
+                try:
+                    prune_moderation_state()
+                except Exception as e:
+                    add_log(f"Moderation state prune failed: {e}")
     except KeyboardInterrupt:   # Ctrl+C / the panel's Stop button: log one line and exit (keep this fast)
         add_log("🛑 Shutting down...")
 
