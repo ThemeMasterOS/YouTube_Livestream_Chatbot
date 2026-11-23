@@ -1118,6 +1118,37 @@ active_streams_lock = threading.Lock()
 active_stream_ids = set()      # video_ids with a running listener thread
 stop_flags = {}                # video_id -> threading.Event(), set() to stop that listener
 
+# v0.3.3.2: listener generations. Every start gets a new, never-reused number so
+# a thread that is still shutting down can tell whether it is still the active
+# listener for its video ID. Without this, a Remove followed by an immediate
+# re-add could have the dying thread wipe the new listener's state.
+_stream_lock = threading.Lock()
+_stream_generations = {}       # video_id -> current listener generation
+_stream_generation_counter = 0 # monotonic; never reset or reused
+
+# v0.3.3.2: live pytchat objects, so Remove can terminate them immediately
+# instead of waiting for the listener thread's locals to be garbage collected.
+_active_chats = {}             # video_id -> pytchat core object
+
+# v0.3.3.2: video_id -> liveChatId, needed to drop _mod_status_cache entries
+# when a stream is removed (that cache is keyed by liveChatId, not video ID).
+_stream_live_chat_ids = {}
+
+
+def _stop_wait(stop_flag, seconds):
+    """Sleep up to `seconds`, returning early (True) if the stream was stopped."""
+    if seconds > 0:
+        stop_flag.wait(seconds)   # Event.wait, unlike time.sleep, is interruptible
+    return stop_flag.is_set()
+
+
+def _next_stream_generation_locked(video_id):
+    """Assign and return a fresh generation for a (re)started listener. Caller holds _stream_lock."""
+    global _stream_generation_counter
+    _stream_generation_counter += 1
+    _stream_generations[video_id] = _stream_generation_counter
+    return _stream_generation_counter
+
 
 # When a stream's channel ID is added/edited on /live while that stream is
 # already running in API-fallback mode, pytchat would otherwise not be retried
@@ -1172,6 +1203,57 @@ def is_stream_running(video_id):
         return video_id in active_stream_ids
 
 
+def _dispose_chat(chat):
+    """Terminate a pytchat object and close its HTTP client (safe to call twice)."""
+    if chat is None:
+        return
+    try:
+        chat.terminate()
+    except Exception:
+        pass
+    try:
+        client = getattr(chat, "_client", None)
+        if client is not None:
+            client.close()
+    except Exception:
+        pass
+
+
+def _register_chat(video_id, chat, generation):
+    """Install this thread's pytchat object; dispose it if the listener is already stale."""
+    with _stream_lock:
+        if _stream_generations.get(video_id) != generation:
+            stale = True
+            old = None
+        else:
+            stale = False
+            old = _active_chats.get(video_id)
+            _active_chats[video_id] = chat
+    if stale:
+        _dispose_chat(chat)       # a Remove happened while this object was being created
+    elif old is not None and old is not chat:
+        _dispose_chat(old)
+    return chat
+
+
+def _release_chat(video_id, generation=None):
+    """Dispose the registered pytchat object. With `generation`, only if that thread is still current."""
+    with _stream_lock:
+        if generation is not None and _stream_generations.get(video_id) != generation:
+            return
+        chat = _active_chats.pop(video_id, None)
+    _dispose_chat(chat)
+
+
+def _forget_live_chat_id(video_id):
+    """Drop a video's liveChatId and its cached bot-mod status (no listener needs them any more)."""
+    with _stream_lock:
+        live_chat_id = _stream_live_chat_ids.pop(video_id, None)
+    if live_chat_id:
+        with _mod_status_cache_lock:
+            _mod_status_cache.pop(live_chat_id, None)
+
+
 def start_stream_listener(video_id, label):
     """Start a listener thread for a video ID if one isn't already running."""
     with active_streams_lock:
@@ -1179,12 +1261,15 @@ def start_stream_listener(video_id, label):
             add_log(f"'{label}' ({video_id}) already has an active listener — skipping duplicate start.")
             return False
         active_stream_ids.add(video_id)
-        stop_flags[video_id] = threading.Event()
+        stop_flag = threading.Event()
+        stop_flags[video_id] = stop_flag
+        with _stream_lock:
+            generation = _next_stream_generation_locked(video_id)
     set_stream_label(video_id, label)
 
     thread = threading.Thread(
         target=listen_to_stream,
-        args=(video_id, label, stop_flags[video_id]),
+        args=(video_id, label, stop_flag, generation),
         daemon=True
     )
     thread.start()
@@ -1199,21 +1284,39 @@ def stop_stream_listener(video_id):
             flag.set()
         active_stream_ids.discard(video_id)
         stop_flags.pop(video_id, None)
-    with stream_labels_lock:
-        stream_labels.pop(video_id, None)
+        with _stream_lock:
+            _stream_generations.pop(video_id, None)   # invalidates the dying thread
+            old_chat = _active_chats.pop(video_id, None)
+        with stream_labels_lock:
+            stream_labels.pop(video_id, None)
+        # Held under active_streams_lock so a Remove + immediate re-add cannot
+        # race: the new listener only registers after this cleanup finishes.
+        clear_stream_state(video_id)                  # moderation / quiz / mod-status
+    _dispose_chat(old_chat)                           # terminate + close pytchat now
 
 
-def mark_stream_stopped(video_id):
+def _finish_self_stopped(video_id, generation):
     """
-    Called by a listener thread on itself when it exits naturally (stream
-    ended, too many API errors) rather than via the /live Remove button.
-    Removes it from active_stream_ids so /live correctly shows ⚪ Stopped
-    instead of leaving it stuck on 🟢 Listening for a thread that's already
-    dead. Does NOT touch stop_flags — Remove button cleanup already
-    handles that path separately, and this only runs for self-ended threads.
+    Called by a listener thread on itself when it exits naturally (stream ended,
+    too many API errors). Returns False without touching anything if a newer
+    listener has since taken over this video ID. Cleanup runs under
+    active_streams_lock so a restart cannot interleave and lose its state.
     """
     with active_streams_lock:
+        with _stream_lock:
+            if _stream_generations.get(video_id) != generation:
+                return False
+            _stream_generations.pop(video_id, None)
         active_stream_ids.discard(video_id)
+        stop_flags.pop(video_id, None)
+        with stream_labels_lock:
+            stream_labels.pop(video_id, None)
+        _clear_pytchat_retry_request(video_id)
+        # Natural end: chat, labels, mod-status and quiz state go right away;
+        # moderation tables stay for the 60-minute grace pruner.
+        _forget_live_chat_id(video_id)
+        _clear_quiz_state(video_id)
+    return True
 
 
 
@@ -1782,7 +1885,7 @@ CHANNEL_UI_JS = r"""
 # The shell is a plain (non-f) string; __BOOT__ becomes JSON (admin flag, commands, counts).
 # Channels, Live and Moderation are served as fragments (/_view/channels, /_view/live, /_view/moderation) and run inside the shell.
 # ---------------------------------------------------------------------------
-BOT_VERSION = "0.3.3.1"
+BOT_VERSION = "0.3.3.2"
 BOT_STARTED_AT = time.time()
 DASHBOARD_PAGES = ("home", "commands", "leaderboard", "logs", "channels", "live", "moderation", "themes")
 
@@ -2562,6 +2665,13 @@ CHANNELS_FRAGMENT_HTML = r"""
 
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
+    # v0.3.3.2: one concise access-log line per response, with query strings
+    # omitted. print() (not add_log) keeps these lines out of the public
+    # /logs dashboard and out of its bounded chat_logs deque.
+    def log_request(self, code="-", size="-"):
+        route = urllib.parse.urlsplit(self.path).path or "/"
+        print(f"[HTTP] {self.command} {route} -> {code}", flush=True)
+
     def _client_ip(self):
         # Rightmost X-Forwarded-For entry is the one Render's proxy added (the leftmost can be spoofed).
         forwarded = self.headers.get("X-Forwarded-For", "")
@@ -3704,7 +3814,6 @@ def start_health_check_server():
     server.daemon_threads = True
     server.serve_forever()
 
-threading.Thread(target=start_health_check_server, daemon=True).start()
 # -----------------------------------------------
 
 # 1. Main Project YouTube Client (Used for sending replies) — required
@@ -3861,7 +3970,7 @@ def pick_reader():
 
 
 # v0.2.8.2: takes stream_name so the log line says which stream connected.
-def getLiveChatId(LIVE_STREAM_ID, stream_name="?"):
+def getLiveChatId(LIVE_STREAM_ID, stream_name="?", generation=None):
     response = call_with_quota_failover(
         lambda yt: yt.videos().list(
             part="liveStreamingDetails",
@@ -3879,6 +3988,12 @@ def getLiveChatId(LIVE_STREAM_ID, stream_name="?"):
 
     if not liveChatId:
         raise Exception(f"No active live chat found for stream '{LIVE_STREAM_ID}'. Make sure the stream is live!")
+
+    # v0.3.3.2: remember the mapping so Remove can drop the liveChatId-keyed
+    # mod-status cache entry. Skip it if this listener was removed meanwhile.
+    with _stream_lock:
+        if generation is None or _stream_generations.get(LIVE_STREAM_ID) == generation:
+            _stream_live_chat_ids[LIVE_STREAM_ID] = liveChatId
 
     add_log(f"Connected to Live Chat ID in '{stream_name}': {liveChatId}")
     return liveChatId
@@ -4083,6 +4198,35 @@ def prune_moderation_state(now=None):
                     _moderation_idle_since.pop(video_id, None)
                     pruned += 1
     return pruned
+
+
+def _clear_quiz_state(video_id):
+    """Cancel and drop a stream's quiz state (safe when no quiz exists)."""
+    with _quiz_lock:
+        quiz = _active_quizzes.pop(video_id, None)
+        if quiz is not None:
+            try:
+                quiz["timer"].cancel()   # no timeout reply into a chat nobody listens to
+            except Exception:
+                pass
+        _quiz_last_answer.pop(video_id, None)
+        _quiz_last_wrong_reply.pop(video_id, None)
+
+
+def clear_stream_state(video_id):
+    """
+    v0.3.3.2: immediate cleanup when a stream is explicitly removed (Remove
+    button, bulk delete, monitor delete). Natural stream ends intentionally
+    keep their moderation tables for the 60-minute grace window handled by
+    prune_moderation_state().
+    """
+    _forget_live_chat_id(video_id)
+    with _moderation_state_lock:
+        for table in (_recent_messages, _offense_counts, _recently_timed_out,
+                      _last_mod_owner_reminder_time, _last_mod_request_time):
+            table.pop(video_id, None)
+        _moderation_idle_since.pop(video_id, None)
+    _clear_quiz_state(video_id)
 
 
 def _send_mod_request(video_id, liveChatId, stream_name):
@@ -4826,7 +4970,23 @@ def process_command(userName, userChannelId, message_text, liveChatId, last_repl
     return last_reply_time
 
 
-def listen_to_stream(stream_id, stream_name, stop_flag):
+def listen_to_stream(stream_id, stream_name, stop_flag, generation):
+    """
+    v0.3.3.2: thread entry point. Runs the listener, then guarantees per-stream
+    cleanup on every exit path (break, early return, exception) instead of
+    leaving it to each branch.
+    """
+    try:
+        _listen_to_stream_impl(stream_id, stream_name, stop_flag, generation)
+    finally:
+        # Dispose this thread's own pytchat object first (generation-guarded,
+        # so it can never touch a listener that was re-added after Remove).
+        _release_chat(stream_id, generation)
+        # Self-stop cleanup (no-op if this listener was explicitly removed).
+        _finish_self_stopped(stream_id, generation)
+
+
+def _listen_to_stream_impl(stream_id, stream_name, stop_flag, generation):
     """
     Listen to a single stream in its own thread. Retries getLiveChatId in a
     loop (not recursion) since chat may not be active yet (e.g. a premiere
@@ -4865,19 +5025,16 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
             return
         try:
             with CONNECTION_GATE.slot(stream_id):
-                liveChatId = getLiveChatId(stream_id, stream_name)
+                liveChatId = getLiveChatId(stream_id, stream_name, generation=generation)
             add_log(f"Started listening to '{stream_name}' ({stream_id})")
         except ConnectionQueueCancelled:
             add_log(f"'{stream_name}' ({stream_id}) stopped while waiting in the connection queue.")
             return
         except AllQuotasExhausted as qe:
             add_log(f"All API quotas exhausted while connecting '{stream_name}' ({stream_id}). Waiting until 00:00 PT ({qe.utc_offset_label} UTC) to retry...")
-            deadline = time.time() + qe.wait_seconds + 5  # small buffer past the reset
-            while time.time() < deadline:
-                if stop_flag.is_set():
-                    add_log(f"'{stream_name}' ({stream_id}) stopped while waiting for quota reset.")
-                    return
-                time.sleep(1)
+            if _stop_wait(stop_flag, qe.wait_seconds + 5):  # small buffer past the reset
+                add_log(f"'{stream_name}' ({stream_id}) stopped while waiting for quota reset.")
+                return
             add_log(f"Quota reset time reached for '{stream_name}'. Retrying live chat ID fetch...")
             continue  # Doesn't count against the retry attempts
         except Exception as e:
@@ -4888,23 +5045,19 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
 
             if is_known_unavailable:
                 add_log(f"🔴 '{stream_name}' ({stream_id}) — no active live chat. Stopping listener.")
-                mark_stream_stopped(stream_id)
                 add_log(f"'{stream_name}' ({stream_id}) listener stopped (never went live / already ended). /live now shows it as ⚪ Stopped.")
                 return
 
             if attempt_number > len(RETRY_DELAYS_SECONDS):
                 add_log(f"🔴 '{stream_name}' ({stream_id}) — unexpected error persisted after {attempt_number} attempts. Stopping listener.")
-                mark_stream_stopped(stream_id)
                 add_log(f"'{stream_name}' ({stream_id}) listener stopped (connection error). /live now shows it as ⚪ Stopped.")
                 return
 
             delay = RETRY_DELAYS_SECONDS[attempt_number - 1]
             attempt_number += 1
             add_log(f"Unexpected error for '{stream_name}' — retrying (attempt {attempt_number}/{len(RETRY_DELAYS_SECONDS) + 1}) in {delay} seconds...")
-            for _ in range(delay):
-                if stop_flag.is_set():
-                    return
-                time.sleep(1)
+            if _stop_wait(stop_flag, delay):
+                return
 
     BLOCKED_BOTS = {"nightbot", "streamelements", "moobot", "streamlabs", "thememasterbot", "nabatchatbot", "windows243remastered"}
     COOLDOWN_SECONDS = 10
@@ -4926,7 +5079,7 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
 
     add_log(f"Connecting pytchat listener for '{stream_name}' (0 quota cost)...")
     try:
-        chat = safe_pytchat_create(stream_id)
+        chat = _register_chat(stream_id, safe_pytchat_create(stream_id), generation)
         chat_started_at = time.time()
         if not chat.is_alive():
             raise Exception(f"Pytchat stream initialization failed ({describe_pytchat_stop(chat)}).")
@@ -4937,8 +5090,6 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
     except Exception as e:
         if active_youtube_backup is None:
             add_log(f"Pytchat failed for '{stream_name}' ({e}). No backup API configured — stopping listener.")
-            with active_streams_lock:
-                active_stream_ids.discard(stream_id)
             return
         add_log(f"Pytchat failed for '{stream_name}' ({e}). Switching to Backup API!")
         use_api_fallback = True
@@ -4963,13 +5114,15 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
                 try:
                     test_chat = safe_pytchat_create(stream_id)
                     if test_chat.is_alive():
-                        chat = test_chat
+                        chat = _register_chat(stream_id, test_chat, generation)
                         chat_started_at = time.time()
                         use_api_fallback = False
                         next_page_token = None
                         add_log(f"Pytchat restored for '{stream_name}'!")
                         continue
-                    add_log(f"Pytchat restore failed for '{stream_name}': replacement chat not alive ({describe_pytchat_stop(test_chat)})")
+                    reason = describe_pytchat_stop(test_chat)
+                    _dispose_chat(test_chat)
+                    add_log(f"Pytchat restore failed for '{stream_name}': replacement chat not alive ({reason})")
                 except Exception as e:
                     add_log(f"Pytchat restore failed for '{stream_name}': {e}")
 
@@ -5016,21 +5169,20 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
                     try:
                         test_chat = safe_pytchat_create(stream_id)
                         if test_chat.is_alive():
-                            chat = test_chat
+                            chat = _register_chat(stream_id, test_chat, generation)
                             chat_started_at = time.time()
                             use_api_fallback = False
                             next_page_token = None
                             add_log(f"Pytchat restored for '{stream_name}'!")
                             continue
                         restore_error = f"replacement chat not alive ({describe_pytchat_stop(test_chat)})"
+                        _dispose_chat(test_chat)
                     except Exception as theme_master:
                         restore_error = str(theme_master)
 
                     # 3) Restore failed (exception OR not alive) -> fallback mode
                     if active_youtube_backup is None:
                         add_log(f"Pytchat failed for '{stream_name}': {restore_error}. No backup API configured — stopping listener.")
-                        with active_streams_lock:
-                            active_stream_ids.discard(stream_id)
                         return
                     add_log(f"Pytchat restore failed for '{stream_name}': {restore_error}. Switching to API fallback...")
                     use_api_fallback = True
@@ -5050,7 +5202,7 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
                         last_reply_time, BLOCKED_BOTS, COOLDOWN_SECONDS, stream_name=stream_name,
                         video_id=stream_id, is_moderator=is_moderator, is_owner=is_owner
                     )
-                time.sleep(1)
+                _stop_wait(stop_flag, 1)
 
             else:
                 if not next_page_token:
@@ -5060,7 +5212,7 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
                     ).execute()
                     next_page_token = response.get('nextPageToken')
                     add_log(f"Anchored '{stream_name}' to API live edge.")
-                    time.sleep(5)
+                    _stop_wait(stop_flag, 5)
                     continue
 
                 request_args = {
@@ -5087,9 +5239,11 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
                         video_id=stream_id, is_moderator=is_moderator, is_owner=is_owner
                     )
 
-                time.sleep(max(polling_millis / 1000.0, 10.0))
+                _stop_wait(stop_flag, max(polling_millis / 1000.0, 10.0))
 
         except HttpError as e:
+            if stop_flag.is_set():
+                break
             gone_reason = chat_gone_description(e)
             if e.resp.status == 403 and "quotaExceeded" in str(e):
                 exhausted_name = _client_name(active_youtube_backup)
@@ -5102,12 +5256,13 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
                     next_page_token = None
                 else:
                     add_log(f"All API clients are out of quota for '{stream_name}'. Pausing 15 seconds before restoring pytchat one last time...")
-                    time.sleep(15)
+                    if _stop_wait(stop_flag, 15):
+                        break
 
                     try:
                         test_chat = safe_pytchat_create(stream_id)
                         if test_chat.is_alive():
-                            chat = test_chat
+                            chat = _register_chat(stream_id, test_chat, generation)
                             chat_started_at = time.time()
                             use_api_fallback = False
                             next_page_token = None
@@ -5115,13 +5270,16 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
                             consecutive_api_failures = 0
                             continue
                         else:
-                            raise Exception(f"Pytchat stream initialization failed ({describe_pytchat_stop(test_chat)}).")
+                            reason = describe_pytchat_stop(test_chat)
+                            _dispose_chat(test_chat)
+                            raise Exception(f"Pytchat stream initialization failed ({reason}).")
                     except ConnectionQueueCancelled:
                         break  # removed while queued; the code after the loop logs the stop
                     except Exception as pytchat_error:
                         wait_seconds, utc_offset_label = seconds_until_next_midnight_pt()
                         add_log(f"Pytchat restore failed for '{stream_name}': {pytchat_error}. Pausing until 00:00 PT ({utc_offset_label} UTC).")
-                        time.sleep(wait_seconds)
+                        if _stop_wait(stop_flag, wait_seconds):
+                            break
                         active_youtube_backup = pick_reader() or default_youtube_reader
                         next_page_token = None
                         use_api_fallback = False  # Try pytchat first on resume
@@ -5139,7 +5297,7 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
                 if consecutive_api_failures >= MAX_CONSECUTIVE_FAILURES:
                     add_log(f"🔴 Stream '{stream_name}' ({stream_id}) has ended (3 consecutive 404s). Stopping listener.")
                     break  # Exit the while loop
-                time.sleep(10)
+                _stop_wait(stop_flag, 10)
             else:
                 # Other API errors (5xx, rate limit, etc.) — don't immediately assume stream ended
                 consecutive_api_failures += 1
@@ -5147,22 +5305,27 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
                 if consecutive_api_failures >= MAX_CONSECUTIVE_FAILURES:
                     add_log(f"🔴 Stream '{stream_name}' ({stream_id}) — too many API errors, stopping listener.")
                     break  # Exit the while loop
-                time.sleep(10)
+                _stop_wait(stop_flag, 10)
         except Exception as e:
+            if stop_flag.is_set():
+                break
             add_log(f"Error in '{stream_name}' chat loop: {e}")
-            time.sleep(3)  # Small pause first, in case it's a transient blip
+            if _stop_wait(stop_flag, 3):  # Small pause first, in case it's a transient blip
+                break
 
             try:
                 test_chat = safe_pytchat_create(stream_id)
                 if test_chat.is_alive():
-                    chat = test_chat
+                    chat = _register_chat(stream_id, test_chat, generation)
                     chat_started_at = time.time()
                     use_api_fallback = False
                     next_page_token = None
                     add_log(f"Pytchat restored for '{stream_name}' after chat loop error!")
                     continue
                 else:
-                    raise Exception(f"Pytchat stream initialization failed ({describe_pytchat_stop(test_chat)}).")
+                    reason = describe_pytchat_stop(test_chat)
+                    _dispose_chat(test_chat)
+                    raise Exception(f"Pytchat stream initialization failed ({reason}).")
             except Exception as restore_error:
                 add_log(f"Pytchat restore failed after chat loop error for '{stream_name}': {restore_error}. Switching to API Fallback...")
                 use_api_fallback = True
@@ -5171,13 +5334,12 @@ def listen_to_stream(stream_id, stream_name, stop_flag):
 
     if stop_flag.is_set():
         # Loop exited because /live's Remove button was clicked —
-        # stop_stream_listener() already cleaned up active_stream_ids.
+        # stop_stream_listener() already cleaned up all per-stream state.
         add_log(f"'{stream_name}' ({stream_id}) listener stopped (removed via /live dashboard).")
     else:
         # Loop exited on its own (break — stream ended / too many API
-        # errors). Nothing has cleaned up active_stream_ids yet, so /live
-        # would otherwise keep showing this as 🟢 Listening forever.
-        mark_stream_stopped(stream_id)
+        # errors). The wrapper below clears active_stream_ids so /live shows
+        # ⚪ Stopped instead of a dead listener stuck on 🟢 Listening.
         add_log(f"'{stream_name}' ({stream_id}) listener stopped (stream ended). /live now shows it as ⚪ Stopped.")
 
 
@@ -6385,6 +6547,11 @@ def main():
                     add_log(f"Moderation state prune failed: {e}")
     except KeyboardInterrupt:   # Ctrl+C / the panel's Stop button: log one line and exit (keep this fast)
         add_log("🛑 Shutting down...")
+
+
+# v0.3.3.2: start the HTTP server only after every module-level definition
+# exists, so an early request can never reach a not-yet-defined helper.
+threading.Thread(target=start_health_check_server, daemon=True).start()
 
 
 if __name__ == "__main__":
