@@ -1,19 +1,21 @@
 """
-pytchat_manual_channel_patch.py
+thememasterchat_manual_channel_patch.py
 
 Adds a last-resort, manually entered channel ID to ThemeMasterChat's
-(pytchat's) channel-ID lookup.
+channel-ID lookup.
 
-Why: pytchat needs a video's channel ID before it can read live chat.
+Why: ThemeMasterChat needs a video's channel ID before it can read live chat.
 ThemeMasterChat already looks it up automatically (YouTube's oEmbed endpoint
 first, then the HTML-scrape routes). From some cloud/datacenter IPs (Render,
 Heroku, etc.) YouTube serves a placeholder page and BOTH automatic lookups
 can fail, even though the video ID is completely valid.
 
-This patch wraps pytchat.util.get_channelid: if the automatic lookups raise,
+This patch wraps thememasterchat.util.get_channelid: if the automatic lookups raise,
 a channel ID entered manually on the bot's /live dashboard is used instead.
 The bot registers those with set_manual_channel_id(); it is only consulted
 after the automatic lookups fail.
+
+v0.3.0: now targets the thememasterchat package (was pytchat); the manual-ID logic is unchanged.
 
 v0.2.0: the oEmbed lookup was removed from this file, because ThemeMasterChat
 now does it natively. Nothing else changed.
@@ -29,8 +31,8 @@ v0.1.2 helpers for the bot's "Select Channel" list on /live:
     Returns None on any failure so the caller can fall back (the bot
     then tries the YouTube Data API, then asks for the UC... ID).
 
-Usage: import and call apply_patch() *before* calling pytchat.create()
-or constructing any pytchat chat object.
+Usage: import and call apply_patch() *before* calling thememasterchat.create()
+or constructing any ThemeMasterChat chat object.
 """
 
 import html as _html
@@ -40,12 +42,11 @@ import unicodedata
 import httpx
 from urllib.parse import quote, unquote
 
-import pytchat.util as _pytchat_util
-from pytchat import config
-from pytchat.exceptions import InvalidVideoIdException
+import thememasterchat.util as _thememasterchat_util
+from thememasterchat.exceptions import InvalidVideoIdException
 
 # Keep a reference to ThemeMasterChat's own lookup (oEmbed, then HTML scrape).
-_original_get_channelid = _pytchat_util.get_channelid
+_original_get_channelid = _thememasterchat_util.get_channelid
 
 _CHANNEL_ID_FULL_RE = re.compile(r"UC[0-9A-Za-z_-]{22}")
 
@@ -67,7 +68,7 @@ def set_manual_channel_id(video_id: str, channel_id) -> None:
     """
     Register a manual channel ID for a video. A blank value — or one that
     isn't a well-formed channel ID — clears it instead, so a malformed ID
-    can never reach pytchat no matter who calls this.
+    can never reach ThemeMasterChat no matter who calls this.
     """
     with _manual_lock:
         if is_valid_channel_id(channel_id):
@@ -88,7 +89,7 @@ def set_manual_used_callback(callback) -> None:
 
 def patched_get_channelid(client, video_id):
     """
-    Drop-in replacement for pytchat.util.get_channelid.
+    Drop-in replacement for thememasterchat.util.get_channelid.
     Order: ThemeMasterChat's lookup (oEmbed -> HTML scrape) -> manual channel ID.
     """
     try:
@@ -243,5 +244,5 @@ def resolve_handle_to_channel_id(handle: str):
 
 
 def apply_patch():
-    """Apply the monkey-patch. Call once, before using pytchat."""
-    _pytchat_util.get_channelid = patched_get_channelid
+    """Apply the monkey-patch. Call once, before using thememasterchat."""
+    _thememasterchat_util.get_channelid = patched_get_channelid
