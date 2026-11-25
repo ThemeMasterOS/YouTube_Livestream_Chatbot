@@ -80,7 +80,7 @@ If any backup's files are missing, the bot detects this automatically at startup
 | `bot v0.2.8.2.py` | The last bot v0.2.x family. I added this in case if u miss the old layout |
 | `auth.py` | Handles Google OAuth login and token refresh |
 | `token_generator.py` | Standalone script to generate `token.json` and backups |
-| `pytchat_manual_channel_patch.py` | Lets you enter a channel ID manually if the automatic lookups fail. Required by `bot.py` |
+| `thememasterchat_manual_channel_patch.py` | Lets you enter a channel ID manually if the automatic lookups fail. Required by `bot.py` |
 | `pytchat_oembed_patch.py` | Patch used by the original pytchat version only. Not needed by `bot.py` |
 | `requirements.txt` | Python dependencies |
 | `How to make your own bot.txt` | Full beginner setup guide |
