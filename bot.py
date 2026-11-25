@@ -4,7 +4,6 @@ import gc
 import json
 import math
 import re
-import signal
 import time
 import random
 import threading
@@ -35,16 +34,16 @@ try:
 except Exception:
     innertube = None
 
-# --- Apply pytchat manual-channel patch BEFORE importing/using pytchat ---
-import pytchat_manual_channel_patch
-pytchat_manual_channel_patch.apply_patch()
-import thememasterchat as pytchat
+# --- Apply ThemeMasterChat manual-channel patch BEFORE importing/using ThemeMasterChat ---
+import thememasterchat_manual_channel_patch
+thememasterchat_manual_channel_patch.apply_patch()
+import thememasterchat
 # ------------------------------------------------------------------
 
 
 # --- Connection queue (v0.2.7.1) ----------------------------------------
 # Limits how many streams may attempt to connect / reconnect to live chat at
-# the same time (getLiveChatId + pytchat.create). Waiting streams are served
+# the same time (getLiveChatId + ThemeMasterChat.create). Waiting streams are served
 # strictly first-come-first-served. A slot is held ONLY while the connect call
 # itself runs, never during sleeps, retry delays or normal chat listening.
 def _env_number(name, default, cast, minimum):
@@ -154,48 +153,35 @@ class ConnectionGate:
 CONNECTION_GATE = ConnectionGate(MAX_CONCURRENT_CONNECTS, CONNECT_MIN_SPACING)
 
 
-def safe_pytchat_create(video_id):
-    """Queued entry point: waits for a connection slot, then creates the pytchat chat."""
+def safe_thememasterchat_create(video_id):
+    """Queued entry point: waits for a connection slot, then creates the ThemeMasterChat chat."""
     with CONNECTION_GATE.slot(video_id):
-        return _safe_pytchat_create_unqueued(video_id)
+        return _safe_thememasterchat_create_unqueued(video_id)
 
 
-def _safe_pytchat_create_unqueued(video_id):
+def _safe_thememasterchat_create_unqueued(video_id):
     """
-    pytchat.create() internally calls signal.signal(signal.SIGINT, ...) to
-    handle Ctrl+C cleanup. That call raises ValueError("signal only works
-    in main thread of the main interpreter") whenever it's not run on the
-    main thread — which is exactly what happens here, since every stream
-    listener runs in its own worker thread to support multiple simultaneous
-    streams.
+    Create the ThemeMasterChat chat object.
 
-    Fix: temporarily replace signal.signal with a no-op only for the
-    duration of pytchat.create(), then restore the real signal.signal
-    immediately after. This only matters off the main thread — the
-    no-op just swallows the registration attempt pytchat doesn't
-    actually need here (there's no Ctrl+C to catch inside a worker thread).
+    ThemeMasterChat's create() registers a SIGINT handler unless told not to,
+    and signal.signal() raises ValueError off the main thread - which is where
+    every stream listener runs. interruptable=False is the library's own switch
+    for multi-threaded programs: it skips that registration (v0.3.3.3 replaces
+    the old temporary signal.signal monkeypatch with it).
     """
-    if threading.current_thread() is threading.main_thread():
-        return pytchat.create(video_id=video_id)
-
-    original_signal = signal.signal
-    signal.signal = lambda *args, **kwargs: None
-    try:
-        return pytchat.create(video_id=video_id)
-    finally:
-        signal.signal = original_signal
+    return thememasterchat.create(video_id=video_id, interruptable=False)
 
 
-# --- pytchat stop-reason helper ---------------------------------------
+# --- ThemeMasterChat stop-reason helper ---------------------------------------
 # is_alive() only says "stopped", not why. raise_for_status() re-raises the
 # stored exception, so we use it to explain every is_alive() == False.
 # Names are matched via the exception's MRO (by name, not import), so a
-# pytchat version that lacks one of them can't break the bot. The labels
+# ThemeMasterChat version that lacks one of them can't break the bot. The labels
 # are hints for the log only; they never change what the bot does.
-# NoContents ("Chat data stream is empty") is what pytchat raises once a stream's
+# NoContents ("Chat data stream is empty") is what ThemeMasterChat raises once a stream's
 # chat has gone empty/offline, so it is treated like ChatDataFinished.
-_PYTCHAT_ENDED_NAMES = {"ChatDataFinished", "FailedExtractContinuation", "NoContents"}
-_PYTCHAT_NETWORK_NAMES = {
+_THEMEMASTERCHAT_ENDED_NAMES = {"ChatDataFinished", "FailedExtractContinuation", "NoContents"}
+_THEMEMASTERCHAT_NETWORK_NAMES = {
     "RetryExceedMaxCount", "UnknownConnectionError",
     # httpx / stdlib network errors (e.g. ReadError "[Errno 11] Resource
     # temporarily unavailable", RemoteProtocolError "ConnectionTerminated")
@@ -205,46 +191,46 @@ _PYTCHAT_NETWORK_NAMES = {
     "ConnectionError", "TimeoutError",
 }
 
-# Restore-loop guard: if a freshly restored pytchat dies again within this many
-# seconds, it counts as a "rapid death". After PYTCHAT_MAX_RAPID_DEATHS in a row
+# Restore-loop guard: if a freshly restored ThemeMasterChat dies again within this many
+# seconds, it counts as a "rapid death". After THEMEMASTERCHAT_MAX_RAPID_DEATHS in a row
 # the bot stops restoring and lets the YouTube API decide (or stops the listener
 # when no backup API exists).
-PYTCHAT_RAPID_DEATH_WINDOW = 30
-PYTCHAT_MAX_RAPID_DEATHS = 3
-_PYTCHAT_UNAVAILABLE_NAMES = {"InvalidVideoIdException", "VideoInfoParseError", "PatternUnmatchError"}
+THEMEMASTERCHAT_RAPID_DEATH_WINDOW = 30
+THEMEMASTERCHAT_MAX_RAPID_DEATHS = 3
+_THEMEMASTERCHAT_UNAVAILABLE_NAMES = {"InvalidVideoIdException", "VideoInfoParseError", "PatternUnmatchError"}
 
 
-def _classify_pytchat_exception(exc):
+def _classify_thememasterchat_exception(exc):
     names = {cls.__name__ for cls in type(exc).__mro__}
-    if names & _PYTCHAT_ENDED_NAMES:
+    if names & _THEMEMASTERCHAT_ENDED_NAMES:
         return "stream likely ended"
-    if names & _PYTCHAT_NETWORK_NAMES:
+    if names & _THEMEMASTERCHAT_NETWORK_NAMES:
         return "network problem"
-    if names & _PYTCHAT_UNAVAILABLE_NAMES:
+    if names & _THEMEMASTERCHAT_UNAVAILABLE_NAMES:
         return "video unavailable, not live, or lookup failed"
     return "other"
 
 
-def describe_pytchat_stop(chat):
-    """Return a readable reason for why a pytchat chat object is not alive."""
+def describe_thememasterchat_stop(chat):
+    """Return a readable reason for why a ThemeMasterChat chat object is not alive."""
     if chat is None:
-        return "no pytchat object exists"
+        return "no ThemeMasterChat object exists"
     try:
         chat.raise_for_status()
     except Exception as e:
-        return f"{_classify_pytchat_exception(e)} - {type(e).__name__}: {e}"
+        return f"{_classify_thememasterchat_exception(e)} - {type(e).__name__}: {e}"
     return "no error reported"
 
 
-def pytchat_stop_means_ended(chat):
-    """True if pytchat's stored exception says the chat data finished.
+def thememasterchat_stop_means_ended(chat):
+    """True if ThemeMasterChat's stored exception says the chat data finished.
     Only a hint: the YouTube API gets the final say before a listener stops."""
     if chat is None:
         return False
     try:
         chat.raise_for_status()
     except Exception as e:
-        return bool({cls.__name__ for cls in type(e).__mro__} & _PYTCHAT_ENDED_NAMES)
+        return bool({cls.__name__ for cls in type(e).__mro__} & _THEMEMASTERCHAT_ENDED_NAMES)
     return False
 
 
@@ -526,7 +512,7 @@ def _channels_state_locked():
         clean = {}
         stored = raw.get("channels")
         for cid, entry in (stored.items() if isinstance(stored, dict) else []):
-            if pytchat_manual_channel_patch.is_valid_channel_id(cid) and isinstance(entry, dict):
+            if thememasterchat_manual_channel_patch.is_valid_channel_id(cid) and isinstance(entry, dict):
                 clean[cid] = {
                     "name": str(entry.get("name") or ""),
                     "handle": str(entry.get("handle") or ""),
@@ -603,7 +589,7 @@ def delete_saved_channel(channel_id):
 def ensure_channel_saved(channel_id):
     """Make sure a channel ID that was just put on a stream is in the saved list
     (as an unnamed entry if it wasn't). Returns True if it was added."""
-    if not pytchat_manual_channel_patch.is_valid_channel_id(channel_id):
+    if not thememasterchat_manual_channel_patch.is_valid_channel_id(channel_id):
         return False
     with _channels_lock:
         channels = _channels_state_locked()["channels"]
@@ -628,7 +614,7 @@ def import_stream_channels_once(streams):
         added = 0
         for data in (streams or {}).values():
             cid = data.get("channel_id") if isinstance(data, dict) else None
-            if cid and pytchat_manual_channel_patch.is_valid_channel_id(cid) and cid not in state["channels"]:
+            if cid and thememasterchat_manual_channel_patch.is_valid_channel_id(cid) and cid not in state["channels"]:
                 state["channels"][cid] = {"name": "", "handle": "", "monitor": False}
                 added += 1
         if added:
@@ -663,7 +649,7 @@ def lookup_handle_via_api(handle):
     if not items:
         return None
     channel_id = items[0].get("id", "")
-    if not pytchat_manual_channel_patch.is_valid_channel_id(channel_id):
+    if not thememasterchat_manual_channel_patch.is_valid_channel_id(channel_id):
         return None
     return {"channel_id": channel_id, "name": (items[0].get("snippet") or {}).get("title", "")}
 
@@ -675,13 +661,13 @@ def resolve_channel_input(text):
     (None, error_message). Order for a handle: /about page scrape (free),
     then the YouTube Data API, then ask for the UC... ID.
     """
-    kind, value = pytchat_manual_channel_patch.parse_channel_input(text)
+    kind, value = thememasterchat_manual_channel_patch.parse_channel_input(text)
 
     if kind == "id":
         return {"channel_id": value, "handle": "", "name": ""}, None
 
     if kind == "handle":
-        found = pytchat_manual_channel_patch.resolve_handle_to_channel_id(value)
+        found = thememasterchat_manual_channel_patch.resolve_handle_to_channel_id(value)
         if not found:
             add_log(f"Page lookup for {value} found nothing — trying the YouTube API.")
             found = lookup_handle_via_api(value)
@@ -1126,9 +1112,9 @@ _stream_lock = threading.Lock()
 _stream_generations = {}       # video_id -> current listener generation
 _stream_generation_counter = 0 # monotonic; never reset or reused
 
-# v0.3.3.2: live pytchat objects, so Remove can terminate them immediately
+# v0.3.3.2: live ThemeMasterChat objects, so Remove can terminate them immediately
 # instead of waiting for the listener thread's locals to be garbage collected.
-_active_chats = {}             # video_id -> pytchat core object
+_active_chats = {}             # video_id -> ThemeMasterChat core object
 
 # v0.3.3.2: video_id -> liveChatId, needed to drop _mod_status_cache entries
 # when a stream is removed (that cache is keyed by liveChatId, not video ID).
@@ -1151,30 +1137,30 @@ def _next_stream_generation_locked(video_id):
 
 
 # When a stream's channel ID is added/edited on /live while that stream is
-# already running in API-fallback mode, pytchat would otherwise not be retried
-# until the next PYTCHAT_RETRY_INTERVAL (10 minutes). This set lets the API
-# handler ask a running listener to retry pytchat right away instead.
-_force_pytchat_retry = set()
-_force_pytchat_retry_lock = threading.Lock()
+# already running in API-fallback mode, ThemeMasterChat would otherwise not be retried
+# until the next THEMEMASTERCHAT_RETRY_INTERVAL (10 minutes). This set lets the API
+# handler ask a running listener to retry ThemeMasterChat right away instead.
+_force_thememasterchat_retry = set()
+_force_thememasterchat_retry_lock = threading.Lock()
 
 
-def request_pytchat_retry(video_id):
-    with _force_pytchat_retry_lock:
-        _force_pytchat_retry.add(video_id)
+def request_thememasterchat_retry(video_id):
+    with _force_thememasterchat_retry_lock:
+        _force_thememasterchat_retry.add(video_id)
 
 
-def _consume_pytchat_retry_request(video_id):
+def _consume_thememasterchat_retry_request(video_id):
     """True (once) if a retry was requested for this stream; clears the request."""
-    with _force_pytchat_retry_lock:
-        if video_id in _force_pytchat_retry:
-            _force_pytchat_retry.discard(video_id)
+    with _force_thememasterchat_retry_lock:
+        if video_id in _force_thememasterchat_retry:
+            _force_thememasterchat_retry.discard(video_id)
             return True
         return False
 
 
-def _clear_pytchat_retry_request(video_id):
-    with _force_pytchat_retry_lock:
-        _force_pytchat_retry.discard(video_id)
+def _clear_thememasterchat_retry_request(video_id):
+    with _force_thememasterchat_retry_lock:
+        _force_thememasterchat_retry.discard(video_id)
 
 
 # v0.3.0.3: live label registry. A listener thread used to keep the label it was started with
@@ -1204,7 +1190,7 @@ def is_stream_running(video_id):
 
 
 def _dispose_chat(chat):
-    """Terminate a pytchat object and close its HTTP client (safe to call twice)."""
+    """Terminate a ThemeMasterChat object and close its HTTP client (safe to call twice)."""
     if chat is None:
         return
     try:
@@ -1220,7 +1206,7 @@ def _dispose_chat(chat):
 
 
 def _register_chat(video_id, chat, generation):
-    """Install this thread's pytchat object; dispose it if the listener is already stale."""
+    """Install this thread's ThemeMasterChat object; dispose it if the listener is already stale."""
     with _stream_lock:
         if _stream_generations.get(video_id) != generation:
             stale = True
@@ -1237,7 +1223,7 @@ def _register_chat(video_id, chat, generation):
 
 
 def _release_chat(video_id, generation=None):
-    """Dispose the registered pytchat object. With `generation`, only if that thread is still current."""
+    """Dispose the registered ThemeMasterChat object. With `generation`, only if that thread is still current."""
     with _stream_lock:
         if generation is not None and _stream_generations.get(video_id) != generation:
             return
@@ -1292,7 +1278,7 @@ def stop_stream_listener(video_id):
         # Held under active_streams_lock so a Remove + immediate re-add cannot
         # race: the new listener only registers after this cleanup finishes.
         clear_stream_state(video_id)                  # moderation / quiz / mod-status
-    _dispose_chat(old_chat)                           # terminate + close pytchat now
+    _dispose_chat(old_chat)                           # terminate + close ThemeMasterChat now
 
 
 def _finish_self_stopped(video_id, generation):
@@ -1311,7 +1297,7 @@ def _finish_self_stopped(video_id, generation):
         stop_flags.pop(video_id, None)
         with stream_labels_lock:
             stream_labels.pop(video_id, None)
-        _clear_pytchat_retry_request(video_id)
+        _clear_thememasterchat_retry_request(video_id)
         # Natural end: chat, labels, mod-status and quiz state go right away;
         # moderation tables stay for the 60-minute grace pruner.
         _forget_live_chat_id(video_id)
@@ -1328,7 +1314,7 @@ def _remove_stream_record(streams, video_id):
     """
     Same cleanup the single-stream Remove (DELETE /api/streams/<id>) performs,
     minus the save: drops the record from the in-memory `streams` dict, stops
-    its listener, and clears its manual channel ID and pending pytchat retry.
+    its listener, and clears its manual channel ID and pending ThemeMasterChat retry.
     Returns (existed, was_running). The caller saves `streams` once.
     """
     existed = video_id in streams
@@ -1337,8 +1323,8 @@ def _remove_stream_record(streams, video_id):
     with active_streams_lock:
         was_running = video_id in active_stream_ids
     stop_stream_listener(video_id)
-    pytchat_manual_channel_patch.set_manual_channel_id(video_id, None)
-    _clear_pytchat_retry_request(video_id)
+    thememasterchat_manual_channel_patch.set_manual_channel_id(video_id, None)
+    _clear_thememasterchat_retry_request(video_id)
     return existed, was_running
 
 
@@ -1885,7 +1871,7 @@ CHANNEL_UI_JS = r"""
 # The shell is a plain (non-f) string; __BOOT__ becomes JSON (admin flag, commands, counts).
 # Channels, Live and Moderation are served as fragments (/_view/channels, /_view/live, /_view/moderation) and run inside the shell.
 # ---------------------------------------------------------------------------
-BOT_VERSION = "0.3.3.2"
+BOT_VERSION = "0.3.3.3"
 BOT_STARTED_AT = time.time()
 DASHBOARD_PAGES = ("home", "commands", "leaderboard", "logs", "channels", "live", "moderation", "themes")
 
@@ -2971,7 +2957,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                         <button type="button" id="channelPickerBtn" class="picker-btn" aria-haspopup="dialog" aria-expanded="false"><span class="picker-label">Select Channel (optional)</span><span class="caret" aria-hidden="true">▾</span></button>
                         <button class="add-btn" onclick="addStream()">▶ Start Listening</button>
                         <p style="font-size: 12px; color: var(--muted); margin: 6px 0 0 0;">
-                            Selecting a channel is optional and a last resort: only pick one if pytchat can't find the
+                            Selecting a channel is optional and a last resort: only pick one if ThemeMasterChat can't find the
                             channel on its own (for example, the creator turned off embedding and the lookups fail from
                             the cloud server). Pick the stream creator's channel, not your bot's. New channel? Open the
                             dropdown and tap Add Channel ID.
@@ -3396,7 +3382,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"message": "Bad request."})
             return
         channel_id = str(body.get("id") or "").strip()
-        saved = get_saved_channel(channel_id) if pytchat_manual_channel_patch.is_valid_channel_id(channel_id) else None
+        saved = get_saved_channel(channel_id) if thememasterchat_manual_channel_patch.is_valid_channel_id(channel_id) else None
         if saved is None:
             self._send_json(404, {"message": "That channel isn't in the saved list."})
             return
@@ -3566,7 +3552,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                     self.wfile.write(json.dumps({"message": "Video ID is required!"}).encode("utf-8"))
                     return
 
-                if channel_id and not pytchat_manual_channel_patch.is_valid_channel_id(channel_id):
+                if channel_id and not thememasterchat_manual_channel_patch.is_valid_channel_id(channel_id):
                     self.wfile.write(json.dumps({
                         "message": "That is not a valid channel ID. It should start with UC and be 24 characters long. Nothing was saved."
                     }).encode("utf-8"))
@@ -3593,8 +3579,8 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                 if has_channel_field and channel_id:
                     ensure_channel_saved(channel_id)  # so it shows up in the Select Channel dropdown
 
-                # Keep the pytchat patch's last-resort lookup in sync with what was saved.
-                pytchat_manual_channel_patch.set_manual_channel_id(video_id, record.get('channel_id'))
+                # Keep the ThemeMasterChat patch's last-resort lookup in sync with what was saved.
+                thememasterchat_manual_channel_patch.set_manual_channel_id(video_id, record.get('channel_id'))
 
                 channel_changed = has_channel_field and channel_id != old_channel_id
                 old_label = existing.get('label', '')
@@ -3613,11 +3599,11 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                         "message": f"Started listening to '{label or video_id}'! Check /logs to confirm connection."
                     }).encode("utf-8"))
                 elif channel_changed and channel_id:
-                    # Already running (likely in API-fallback mode) — ask it to retry pytchat now
+                    # Already running (likely in API-fallback mode) — ask it to retry ThemeMasterChat now
                     # instead of waiting for the next scheduled retry.
-                    request_pytchat_retry(video_id)
+                    request_thememasterchat_retry(video_id)
                     self.wfile.write(json.dumps({
-                        "message": f"Channel ID saved for '{label or video_id}'. Retrying pytchat now — check /logs."
+                        "message": f"Channel ID saved for '{label or video_id}'. Retrying ThemeMasterChat now — check /logs."
                     }).encode("utf-8"))
                 elif channel_changed:
                     self.wfile.write(json.dumps({
@@ -3641,8 +3627,8 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                     save_streams(streams)
 
                 stop_stream_listener(video_id)
-                pytchat_manual_channel_patch.set_manual_channel_id(video_id, None)
-                _clear_pytchat_retry_request(video_id)
+                thememasterchat_manual_channel_patch.set_manual_channel_id(video_id, None)
+                _clear_thememasterchat_retry_request(video_id)
 
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -3724,7 +3710,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             channel_ids = []
             for raw_id in raw_channels:
                 cid = str(raw_id).strip()
-                if pytchat_manual_channel_patch.is_valid_channel_id(cid) and cid not in channel_ids:
+                if thememasterchat_manual_channel_patch.is_valid_channel_id(cid) and cid not in channel_ids:
                     channel_ids.append(cid)
             channel_ids = channel_ids[:500]
 
@@ -4649,7 +4635,7 @@ def handle_quiz_answer(userName, userChannelId, lower_msg, liveChatId, last_repl
 
 
 def process_command(userName, userChannelId, message_text, liveChatId, last_reply_time, BLOCKED_BOTS, COOLDOWN_SECONDS, stream_name="?", video_id=None, is_moderator=False, is_owner=False, recent_messages=None):
-    """Processes commands coming from either pytchat or backup API."""
+    """Processes commands coming from either ThemeMasterChat or backup API."""
     clean_name = userName.lower().replace('@', '')
     clean_handle = str(userChannelId).lower().replace('@', '')
 
@@ -4979,7 +4965,7 @@ def listen_to_stream(stream_id, stream_name, stop_flag, generation):
     try:
         _listen_to_stream_impl(stream_id, stream_name, stop_flag, generation)
     finally:
-        # Dispose this thread's own pytchat object first (generation-guarded,
+        # Dispose this thread's own ThemeMasterChat object first (generation-guarded,
         # so it can never touch a listener that was re-added after Remove).
         _release_chat(stream_id, generation)
         # Self-stop cleanup (no-op if this listener was explicitly removed).
@@ -4993,10 +4979,10 @@ def _listen_to_stream_impl(stream_id, stream_name, stop_flag, generation):
     that hasn't started playing). Checks stop_flag regularly so the /live
     dashboard's Remove button can cleanly shut this thread down.
 
-    Each stream gets its own independent pytchat -> Backup 1 API -> Backup 2
+    Each stream gets its own independent ThemeMasterChat -> Backup 1 API -> Backup 2
     API fallback chain, same as the original single-stream design.
     """
-    _clear_pytchat_retry_request(stream_id)  # a brand-new listener tries pytchat first anyway
+    _clear_thememasterchat_retry_request(stream_id)  # a brand-new listener tries ThemeMasterChat first anyway
 
     # API fallback reader: Backup 1 -> Backup 2 -> Main (last resort). Never None,
     # because Main is always configured. default_youtube_reader is where we
@@ -5067,31 +5053,31 @@ def _listen_to_stream_impl(stream_id, stream_name, stop_flag, generation):
     next_page_token = None
     chat = None
 
-    last_pytchat_retry = 0
-    chat_started_at = time.time()   # when the current pytchat object was created
-    rapid_pytchat_deaths = 0        # consecutive deaths shortly after a restore
-    PYTCHAT_RETRY_INTERVAL = 120
+    last_thememasterchat_retry = 0
+    chat_started_at = time.time()   # when the current ThemeMasterChat object was created
+    rapid_thememasterchat_deaths = 0        # consecutive deaths shortly after a restore
+    THEMEMASTERCHAT_RETRY_INTERVAL = 120
 
     # Stream-end detection: count consecutive API failures
     # If we get 3+ in a row, the stream has likely ended
     consecutive_api_failures = 0
     MAX_CONSECUTIVE_FAILURES = 3
 
-    add_log(f"Connecting pytchat listener for '{stream_name}' (0 quota cost)...")
+    add_log(f"Connecting ThemeMasterChat listener for '{stream_name}' (0 quota cost)...")
     try:
-        chat = _register_chat(stream_id, safe_pytchat_create(stream_id), generation)
+        chat = _register_chat(stream_id, safe_thememasterchat_create(stream_id), generation)
         chat_started_at = time.time()
         if not chat.is_alive():
-            raise Exception(f"Pytchat stream initialization failed ({describe_pytchat_stop(chat)}).")
-        add_log(f"Listening to '{stream_name}' via pytchat...")
+            raise Exception(f"ThemeMasterChat stream initialization failed ({describe_thememasterchat_stop(chat)}).")
+        add_log(f"Listening to '{stream_name}' via ThemeMasterChat...")
     except ConnectionQueueCancelled:
         add_log(f"'{stream_name}' ({stream_id}) stopped while waiting in the connection queue.")
         return
     except Exception as e:
         if active_youtube_backup is None:
-            add_log(f"Pytchat failed for '{stream_name}' ({e}). No backup API configured — stopping listener.")
+            add_log(f"ThemeMasterChat failed for '{stream_name}' ({e}). No backup API configured — stopping listener.")
             return
-        add_log(f"Pytchat failed for '{stream_name}' ({e}). Switching to Backup API!")
+        add_log(f"ThemeMasterChat failed for '{stream_name}' ({e}). Switching to Backup API!")
         use_api_fallback = True
 
     while not stop_flag.is_set():
@@ -5101,94 +5087,94 @@ def _listen_to_stream_impl(stream_id, stream_name, stop_flag, generation):
 
             # Always consume a pending "retry now" request (set when a channel ID is
             # saved on /live), even if we're not in fallback mode — otherwise a request
-            # made while pytchat was healthy would linger and trigger a pointless
+            # made while ThemeMasterChat was healthy would linger and trigger a pointless
             # retry the next time the stream falls back.
-            retry_requested = _consume_pytchat_retry_request(stream_id)
+            retry_requested = _consume_thememasterchat_retry_request(stream_id)
 
             if use_api_fallback and (
-                current_time - last_pytchat_retry > PYTCHAT_RETRY_INTERVAL
+                current_time - last_thememasterchat_retry > THEMEMASTERCHAT_RETRY_INTERVAL
                 or retry_requested
             ):
-                add_log(f"Attempting to restore pytchat for '{stream_name}'...")
-                last_pytchat_retry = current_time
+                add_log(f"Attempting to restore ThemeMasterChat for '{stream_name}'...")
+                last_thememasterchat_retry = current_time
                 try:
-                    test_chat = safe_pytchat_create(stream_id)
+                    test_chat = safe_thememasterchat_create(stream_id)
                     if test_chat.is_alive():
                         chat = _register_chat(stream_id, test_chat, generation)
                         chat_started_at = time.time()
                         use_api_fallback = False
                         next_page_token = None
-                        add_log(f"Pytchat restored for '{stream_name}'!")
+                        add_log(f"ThemeMasterChat restored for '{stream_name}'!")
                         continue
-                    reason = describe_pytchat_stop(test_chat)
+                    reason = describe_thememasterchat_stop(test_chat)
                     _dispose_chat(test_chat)
-                    add_log(f"Pytchat restore failed for '{stream_name}': replacement chat not alive ({reason})")
+                    add_log(f"ThemeMasterChat restore failed for '{stream_name}': replacement chat not alive ({reason})")
                 except Exception as e:
-                    add_log(f"Pytchat restore failed for '{stream_name}': {e}")
+                    add_log(f"ThemeMasterChat restore failed for '{stream_name}': {e}")
 
             if not use_api_fallback:
                 if not chat or not chat.is_alive():
                     # 1) Log WHY the old chat stopped before it gets replaced
-                    stop_reason = describe_pytchat_stop(chat)
+                    stop_reason = describe_thememasterchat_stop(chat)
 
                     # Rapid-death counter: did this chat die right after being (re)created?
-                    if time.time() - chat_started_at < PYTCHAT_RAPID_DEATH_WINDOW:
-                        rapid_pytchat_deaths += 1
+                    if time.time() - chat_started_at < THEMEMASTERCHAT_RAPID_DEATH_WINDOW:
+                        rapid_thememasterchat_deaths += 1
                     else:
-                        rapid_pytchat_deaths = 0  # it lived a while, so this is an isolated death
+                        rapid_thememasterchat_deaths = 0  # it lived a while, so this is an isolated death
 
-                    if active_youtube_backup is not None and pytchat_stop_means_ended(chat):
-                        rapid_pytchat_deaths = 0
-                        # Pytchat itself says the chat data finished. Skip the (likely
+                    if active_youtube_backup is not None and thememasterchat_stop_means_ended(chat):
+                        rapid_thememasterchat_deaths = 0
+                        # ThemeMasterChat itself says the chat data finished. Skip the (likely
                         # futile) restore and let the YouTube API give the final verdict:
                         # liveChatEnded/Disabled/NotFound stops the listener, while a
-                        # normal API response means pytchat was wrong and the periodic
-                        # pytchat retry will bring it back later.
-                        add_log(f"Pytchat stopped for '{stream_name}': {stop_reason}. Verifying with the YouTube API before deciding...")
+                        # normal API response means ThemeMasterChat was wrong and the periodic
+                        # ThemeMasterChat retry will bring it back later.
+                        add_log(f"ThemeMasterChat stopped for '{stream_name}': {stop_reason}. Verifying with the YouTube API before deciding...")
                         use_api_fallback = True
                         next_page_token = None
-                        last_pytchat_retry = time.time()
+                        last_thememasterchat_retry = time.time()
                         continue
 
                     # Restore-loop guard: stop restoring a chat that keeps dying instantly
-                    if rapid_pytchat_deaths >= PYTCHAT_MAX_RAPID_DEATHS:
-                        add_log(f"Pytchat keeps dying right after restore ({rapid_pytchat_deaths}x in a row) for '{stream_name}': {stop_reason}.")
-                        rapid_pytchat_deaths = 0
+                    if rapid_thememasterchat_deaths >= THEMEMASTERCHAT_MAX_RAPID_DEATHS:
+                        add_log(f"ThemeMasterChat keeps dying right after restore ({rapid_thememasterchat_deaths}x in a row) for '{stream_name}': {stop_reason}.")
+                        rapid_thememasterchat_deaths = 0
                         if active_youtube_backup is None:
                             add_log(f"🔴 Stream '{stream_name}' ({stream_id}) — no backup API configured to verify. Stopping listener.")
                             break  # Exit the while loop (cleanup below marks it stopped)
                         add_log(f"Verifying '{stream_name}' with the YouTube API before deciding...")
                         use_api_fallback = True
                         next_page_token = None
-                        last_pytchat_retry = time.time()
+                        last_thememasterchat_retry = time.time()
                         continue
 
-                    add_log(f"Pytchat stopped for '{stream_name}': {stop_reason}. Attempting to restore pytchat...")
+                    add_log(f"ThemeMasterChat stopped for '{stream_name}': {stop_reason}. Attempting to restore ThemeMasterChat...")
                     restore_error = None
                     # 2) One restore attempt
                     try:
-                        test_chat = safe_pytchat_create(stream_id)
+                        test_chat = safe_thememasterchat_create(stream_id)
                         if test_chat.is_alive():
                             chat = _register_chat(stream_id, test_chat, generation)
                             chat_started_at = time.time()
                             use_api_fallback = False
                             next_page_token = None
-                            add_log(f"Pytchat restored for '{stream_name}'!")
+                            add_log(f"ThemeMasterChat restored for '{stream_name}'!")
                             continue
-                        restore_error = f"replacement chat not alive ({describe_pytchat_stop(test_chat)})"
+                        restore_error = f"replacement chat not alive ({describe_thememasterchat_stop(test_chat)})"
                         _dispose_chat(test_chat)
                     except Exception as theme_master:
                         restore_error = str(theme_master)
 
                     # 3) Restore failed (exception OR not alive) -> fallback mode
                     if active_youtube_backup is None:
-                        add_log(f"Pytchat failed for '{stream_name}': {restore_error}. No backup API configured — stopping listener.")
+                        add_log(f"ThemeMasterChat failed for '{stream_name}': {restore_error}. No backup API configured — stopping listener.")
                         return
-                    add_log(f"Pytchat restore failed for '{stream_name}': {restore_error}. Switching to API fallback...")
+                    add_log(f"ThemeMasterChat restore failed for '{stream_name}': {restore_error}. Switching to API fallback...")
                     use_api_fallback = True
                     next_page_token = None
-                    last_pytchat_retry = time.time()
-                    continue  # Route to the API-fallback branch next pass, not the dead pytchat object below
+                    last_thememasterchat_retry = time.time()
+                    continue  # Route to the API-fallback branch next pass, not the dead ThemeMasterChat object below
 
                 for msg_item in chat.get().sync_items():
                     userName = msg_item.author.name
@@ -5255,36 +5241,36 @@ def _listen_to_stream_impl(stream_id, stream_name, stop_flag, generation):
                     active_youtube_backup = next_reader
                     next_page_token = None
                 else:
-                    add_log(f"All API clients are out of quota for '{stream_name}'. Pausing 15 seconds before restoring pytchat one last time...")
+                    add_log(f"All API clients are out of quota for '{stream_name}'. Pausing 15 seconds before restoring ThemeMasterChat one last time...")
                     if _stop_wait(stop_flag, 15):
                         break
 
                     try:
-                        test_chat = safe_pytchat_create(stream_id)
+                        test_chat = safe_thememasterchat_create(stream_id)
                         if test_chat.is_alive():
                             chat = _register_chat(stream_id, test_chat, generation)
                             chat_started_at = time.time()
                             use_api_fallback = False
                             next_page_token = None
-                            add_log(f"Pytchat restored for '{stream_name}'! Resuming without waiting for quota reset.")
+                            add_log(f"ThemeMasterChat restored for '{stream_name}'! Resuming without waiting for quota reset.")
                             consecutive_api_failures = 0
                             continue
                         else:
-                            reason = describe_pytchat_stop(test_chat)
+                            reason = describe_thememasterchat_stop(test_chat)
                             _dispose_chat(test_chat)
-                            raise Exception(f"Pytchat stream initialization failed ({reason}).")
+                            raise Exception(f"ThemeMasterChat stream initialization failed ({reason}).")
                     except ConnectionQueueCancelled:
                         break  # removed while queued; the code after the loop logs the stop
-                    except Exception as pytchat_error:
+                    except Exception as thememasterchat_error:
                         wait_seconds, utc_offset_label = seconds_until_next_midnight_pt()
-                        add_log(f"Pytchat restore failed for '{stream_name}': {pytchat_error}. Pausing until 00:00 PT ({utc_offset_label} UTC).")
+                        add_log(f"ThemeMasterChat restore failed for '{stream_name}': {thememasterchat_error}. Pausing until 00:00 PT ({utc_offset_label} UTC).")
                         if _stop_wait(stop_flag, wait_seconds):
                             break
                         active_youtube_backup = pick_reader() or default_youtube_reader
                         next_page_token = None
-                        use_api_fallback = False  # Try pytchat first on resume
-                        last_pytchat_retry = time.time()
-                        add_log(f"Quota reset time reached for '{stream_name}'. Retrying pytchat first...")
+                        use_api_fallback = False  # Try ThemeMasterChat first on resume
+                        last_thememasterchat_retry = time.time()
+                        add_log(f"Quota reset time reached for '{stream_name}'. Retrying ThemeMasterChat first...")
                 consecutive_api_failures = 0  # Quota errors don't mean the stream ended
             elif gone_reason:
                 # YouTube explicitly says the chat is gone -> no need for 3 strikes
@@ -5314,23 +5300,23 @@ def _listen_to_stream_impl(stream_id, stream_name, stop_flag, generation):
                 break
 
             try:
-                test_chat = safe_pytchat_create(stream_id)
+                test_chat = safe_thememasterchat_create(stream_id)
                 if test_chat.is_alive():
                     chat = _register_chat(stream_id, test_chat, generation)
                     chat_started_at = time.time()
                     use_api_fallback = False
                     next_page_token = None
-                    add_log(f"Pytchat restored for '{stream_name}' after chat loop error!")
+                    add_log(f"ThemeMasterChat restored for '{stream_name}' after chat loop error!")
                     continue
                 else:
-                    reason = describe_pytchat_stop(test_chat)
+                    reason = describe_thememasterchat_stop(test_chat)
                     _dispose_chat(test_chat)
-                    raise Exception(f"Pytchat stream initialization failed ({reason}).")
+                    raise Exception(f"ThemeMasterChat stream initialization failed ({reason}).")
             except Exception as restore_error:
-                add_log(f"Pytchat restore failed after chat loop error for '{stream_name}': {restore_error}. Switching to API Fallback...")
+                add_log(f"ThemeMasterChat restore failed after chat loop error for '{stream_name}': {restore_error}. Switching to API Fallback...")
                 use_api_fallback = True
                 next_page_token = None
-                last_pytchat_retry = time.time()
+                last_thememasterchat_retry = time.time()
 
     if stop_flag.is_set():
         # Loop exited because /live's Remove button was clicked —
@@ -5370,7 +5356,7 @@ def _listen_to_stream_impl(stream_id, stream_name, stop_flag, generation):
 # Verified upcoming/live broadcasts go through the SAME Live-tab machinery as a
 # manual entry (streams_config.json + start_stream_listener), tagged "auto".
 # Upcoming broadcasts connect to chat as soon as YouTube reports a chat ID
-# (pytchat works before the stream starts). Only auto-added UPCOMING listeners
+# (ThemeMasterChat works before the stream starts). Only auto-added UPCOMING listeners
 # count toward MAX_PRESTART_LISTENERS; live broadcasts are never capped and are
 # served first; manual Live-tab entries are never counted or touched.
 # Discovery state is kept in memory only (no GitHub commits every few minutes).
@@ -6363,8 +6349,8 @@ def _mon_admit():
         else:
             label = entry.get("label") or rec.get("title") or vid
         cid = rec.get("channel_id")
-        if cid and pytchat_manual_channel_patch.is_valid_channel_id(cid):
-            pytchat_manual_channel_patch.set_manual_channel_id(vid, cid)
+        if cid and thememasterchat_manual_channel_patch.is_valid_channel_id(cid):
+            thememasterchat_manual_channel_patch.set_manual_channel_id(vid, cid)
         if start_stream_listener(vid, label):
             rec["auto_added"] = True
             starts.append(now)
@@ -6495,9 +6481,9 @@ def main():
     add_log("🤖 YouTube Bot Starting...")
     add_log("=" * 60)
 
-    # Log whenever pytchat has to fall back to a channel ID entered on /live
+    # Log whenever ThemeMasterChat has to fall back to a channel ID entered on /live
     # (i.e. ThemeMasterChat's automatic lookups failed for that video).
-    pytchat_manual_channel_patch.set_manual_used_callback(
+    thememasterchat_manual_channel_patch.set_manual_used_callback(
         lambda vid, cid: add_log(f"Automatic channel ID lookup failed for '{vid}' — using the manual channel ID instead.")
     )
 
@@ -6514,13 +6500,13 @@ def main():
     else:
         add_log(f"✅ Found {len(streams)} saved stream(s). Starting listeners...")
 
-        # Register saved manual channel IDs BEFORE any listener starts, so pytchat's
+        # Register saved manual channel IDs BEFORE any listener starts, so ThemeMasterChat's
         # last-resort lookup can use them on the very first connection attempt.
         manual_count = 0
         for video_id, data in streams.items():
             manual_id = data.get('channel_id') if isinstance(data, dict) else None
-            if manual_id and pytchat_manual_channel_patch.is_valid_channel_id(manual_id):
-                pytchat_manual_channel_patch.set_manual_channel_id(video_id, manual_id)
+            if manual_id and thememasterchat_manual_channel_patch.is_valid_channel_id(manual_id):
+                thememasterchat_manual_channel_patch.set_manual_channel_id(video_id, manual_id)
                 manual_count += 1
         if manual_count:
             add_log(f"Registered {manual_count} manual channel ID(s) from saved streams.")
