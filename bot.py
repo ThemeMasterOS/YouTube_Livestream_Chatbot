@@ -38,7 +38,7 @@ except Exception:
 # --- Apply pytchat manual-channel patch BEFORE importing/using pytchat ---
 import pytchat_manual_channel_patch
 pytchat_manual_channel_patch.apply_patch()
-import pytchat
+import thememasterchat as pytchat
 # ------------------------------------------------------------------
 
 
